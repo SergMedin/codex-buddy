@@ -8,9 +8,15 @@
 extern M5Canvas spr;
 
 static const char* STATE_NAMES[] = {
-  "sleep", "idle", "busy", "attention", "celebrate", "dizzy", "heart"
+  "sleep", "idle", "busy", "attention", "completed", "dizzy", "heart"
 };
 static const uint8_t N_STATES = 7;
+
+static JsonVariant stateVariant(JsonObject states, uint8_t idx) {
+  JsonVariant v = states[STATE_NAMES[idx]];
+  if (v.isNull() && idx == 4) v = states["celebrate"];
+  return v;
+}
 
 // Text mode: manifest has "mode":"text", states contain {frames:[...],delay:N}.
 // Frames are short strings rendered at text size 2, centered. No GIF pipeline.
@@ -38,6 +44,7 @@ static uint8_t curState = 0xFF;
 static AnimatedGIF gif;
 static File        gifFile;
 static int         gifX = 0, gifY = 0, gifW = 0, gifH = 0;
+static uint8_t     renderScalePct = 50;
 // Peek mode pins the GIF bottom to the info-panel top (y=70) so the pet
 // sits on the panel edge regardless of canvas height. Home mode centers
 // in the upper 140px. No padding assumed in the source art.
@@ -49,11 +56,11 @@ static bool        peekBottomAlign = false;
 // Draw target — defaults to the sprite; characterRenderTo() retargets to
 // M5.Lcd for the landscape clock (both inherit lgfx::v1::LGFXBase).
 static lgfx::LGFXBase*   _tgt = &spr;
-// Peek mode renders at half scale (2:1 nearest-neighbor in gifDrawCb) so
-// the whole pet fits the 70px window instead of cropping the top.
+// Peek mode defaults to half scale. Direct landscape render can temporarily
+// raise renderScalePct while keeping the portrait path unchanged.
 static void gifPlace() {
-  int outW = peekMode ? gifW / 2 : gifW;
-  int outH = peekMode ? gifH / 2 : gifH;
+  int outW = peekMode ? (gifW * renderScalePct) / 100 : gifW;
+  int outH = peekMode ? (gifH * renderScalePct) / 100 : gifH;
   gifX = (spr.width() - outW) / 2;
   gifY = peekMode
     ? peekTopY + (peekBottomAlign ? peekClipH - outH : (peekClipH - outH) / 2)
@@ -123,12 +130,17 @@ static void gifDrawCb(GIFDRAW* d) {
   };
 
   if (peekMode) {
-    if (srcY & 1) return;
-    int y = gifY + (srcY >> 1);
+    int y = gifY + (srcY * renderScalePct) / 100;
     if (y < peekTopY || y >= peekTopY + peekClipH) return;
-    int x0 = gifX + (d->iX >> 1);
-    int w  = d->iWidth >> 1;
-    for (int i = 0; i < w; i++) put(x0 + i, y, src[i << 1]);
+    int x0 = gifX + (d->iX * renderScalePct) / 100;
+    int w  = ((d->iX + d->iWidth) * renderScalePct) / 100
+           - (d->iX * renderScalePct) / 100;
+    if (w <= 0) return;
+    for (int i = 0; i < w; i++) {
+      int srcX = (i * 100) / renderScalePct;
+      if (srcX >= d->iWidth) srcX = d->iWidth - 1;
+      put(x0 + i, y, src[srcX]);
+    }
     return;
   }
 
@@ -214,7 +226,7 @@ bool characterInit(const char* name) {
       TextState& ts = textStates[i];
       ts.nFrames = 0;
       ts.delayMs = 200;
-      JsonObject st = states[STATE_NAMES[i]];
+      JsonObject st = stateVariant(states, i).as<JsonObject>();
       if (st.isNull()) continue;
       ts.delayMs = st["delay"] | 200;
       JsonArray fr = st["frames"];
@@ -236,7 +248,7 @@ bool characterInit(const char* name) {
     stateStart[i] = gifTotal;
     stateCount[i] = 0;
     stateRot[i]   = 0;
-    JsonVariant v = states[STATE_NAMES[i]];
+    JsonVariant v = stateVariant(states, i);
     if (v.is<JsonArray>()) {
       for (JsonVariant e : v.as<JsonArray>()) {
         if (gifTotal >= MAX_GIFS) break;
@@ -261,7 +273,7 @@ const Palette& characterPalette() { return pal; }
 // One-shot half-scale render to an arbitrary surface (M5.Lcd for the
 // landscape clock). Caller owns clearing. Advances frame timing so
 // animation runs even when characterTick() is bypassed.
-void characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy) {
+bool characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy) {
   uint32_t now = millis();
   if (!gifOpen) {
     if (animPauseUntil && now >= animPauseUntil && curState < N_STATES) {
@@ -270,15 +282,18 @@ void characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy) {
       uint8_t s = curState; curState = 0xFF;
       characterSetState(s);
     }
-    if (!gifOpen) return;
+    if (!gifOpen) return false;
   }
 
   lgfx::v1::LGFXBase* prevT = _tgt; bool prevP = peekMode; int px = gifX, py = gifY, pc = peekClipH, pt = peekTopY;
+  uint8_t prevScale = renderScalePct;
   _tgt = tgt; peekMode = true;
+  renderScalePct = 50;
   peekTopY = 0;
   peekClipH = tgt->height();
   gifX = cx - gifW / 4;
   gifY = cy - gifH / 4;
+  bool drewFrame = false;
   if (now >= nextFrameAt) {
     int delayMs = 0;
     if (!gif.playFrame(false, &delayMs)) {
@@ -287,13 +302,78 @@ void characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy) {
       gif.close();
       gifOpen = false;
       animPauseUntil = now + (bleConnected() ? ANIM_PAUSE_CONNECTED_MS : ANIM_PAUSE_DISCONNECTED_MS);
-      _tgt = prevT; peekMode = prevP; peekClipH = pc; peekTopY = pt; gifX = px; gifY = py;
-      return;
+      _tgt = prevT; peekMode = prevP; renderScalePct = prevScale; peekClipH = pc; peekTopY = pt; gifX = px; gifY = py;
+      return false;
     }
+    drewFrame = true;
     delay(1);  // yield to BLE / FreeRTOS tasks after a GIF decode burst
     nextFrameAt = now + (delayMs > 0 ? delayMs : 100);
   }
-  _tgt = prevT; peekMode = prevP; peekClipH = pc; peekTopY = pt; gifX = px; gifY = py;
+  _tgt = prevT; peekMode = prevP; renderScalePct = prevScale; peekClipH = pc; peekTopY = pt; gifX = px; gifY = py;
+  return drewFrame;
+}
+
+bool characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy, uint8_t scalePct,
+                       int minX, int minY, int maxX, int maxY) {
+  uint32_t now = millis();
+  if (!gifOpen) {
+    if (animPauseUntil && now >= animPauseUntil && curState < N_STATES) {
+      animPauseUntil = 0;
+      keepFrameOnNextOpen = true;
+      uint8_t s = curState; curState = 0xFF;
+      characterSetState(s);
+    }
+    if (!gifOpen) return false;
+  }
+
+  if (scalePct < 25) scalePct = 25;
+  if (scalePct > 100) scalePct = 100;
+  if (maxX <= minX) maxX = minX + 1;
+  if (maxY <= minY) maxY = minY + 1;
+
+  int outW = (gifW * scalePct) / 100;
+  int outH = (gifH * scalePct) / 100;
+  int boundW = maxX - minX;
+  int boundH = maxY - minY;
+  if (outW > boundW || outH > boundH) {
+    uint8_t sx = (uint8_t)((uint32_t)boundW * 100 / gifW);
+    uint8_t sy = (uint8_t)((uint32_t)boundH * 100 / gifH);
+    scalePct = sx < sy ? sx : sy;
+    if (scalePct < 25) scalePct = 25;
+    outW = (gifW * scalePct) / 100;
+    outH = (gifH * scalePct) / 100;
+  }
+
+  int x = cx - outW / 2;
+  int y = cy - outH / 2;
+  if (x < minX) x = minX;
+  if (y < minY) y = minY;
+  if (x + outW > maxX) x = maxX - outW;
+  if (y + outH > maxY) y = maxY - outH;
+
+  lgfx::v1::LGFXBase* prevT = _tgt; bool prevP = peekMode; int px = gifX, py = gifY, pc = peekClipH, pt = peekTopY;
+  uint8_t prevScale = renderScalePct;
+  _tgt = tgt; peekMode = true; renderScalePct = scalePct;
+  peekTopY = minY;
+  peekClipH = maxY - minY;
+  gifX = x;
+  gifY = y;
+  bool drewFrame = false;
+  if (now >= nextFrameAt) {
+    int delayMs = 0;
+    if (!gif.playFrame(false, &delayMs)) {
+      gif.close();
+      gifOpen = false;
+      animPauseUntil = now + (bleConnected() ? ANIM_PAUSE_CONNECTED_MS : ANIM_PAUSE_DISCONNECTED_MS);
+      _tgt = prevT; peekMode = prevP; renderScalePct = prevScale; peekClipH = pc; peekTopY = pt; gifX = px; gifY = py;
+      return false;
+    }
+    drewFrame = true;
+    delay(1);
+    nextFrameAt = now + (delayMs > 0 ? delayMs : 100);
+  }
+  _tgt = prevT; peekMode = prevP; renderScalePct = prevScale; peekClipH = pc; peekTopY = pt; gifX = px; gifY = py;
+  return drewFrame;
 }
 
 void characterSetPeek(bool peek) {

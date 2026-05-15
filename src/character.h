@@ -10,7 +10,7 @@ struct Palette {
 bool characterInit(const char* name);
 bool characterLoaded();
 
-// 0..6: sleep, idle, busy, attention, celebrate, dizzy, heart.
+// 0..6: sleep, idle, busy, attention, completed, dizzy, heart.
 // Closes current GIF, opens the one for this state. No-op if same state.
 void characterSetState(uint8_t state);
 
@@ -27,6 +27,10 @@ void characterSetPeek(bool peek);
 void characterSetPeekWindow(int topY, int height);
 void characterSetPeekBottomAlign(bool bottomAlign);
 namespace lgfx { inline namespace v1 { class LGFXBase; } }
-void characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy);
+// Renders one GIF frame to an arbitrary target when frame timing allows it.
+// Returns true only when a new frame was drawn.
+bool characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy);
+bool characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy, uint8_t scalePct,
+                       int minX, int minY, int maxX, int maxY);
 
 const Palette& characterPalette();

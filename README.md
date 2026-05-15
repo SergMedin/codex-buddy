@@ -1,168 +1,264 @@
-# Claude Desktop Buddy GIF Edition for M5Stack StickS3
-<img width="1280" height="909" alt="20260513-175515" src="https://github.com/user-attachments/assets/d0ac10a8-12dd-4871-af1d-88e1d7359830" />
-This is a personal fork of Anthropic's
+# Codex Usage Stick
+
+Codex Usage Stick is a prototype firmware and local Codex plugin for turning an
+M5Stack StickS3 into a small desktop usage monitor.
+
+The StickS3 shows Codex usage over BLE: a GIF pet, a 5-hour usage bar, a 7-day
+usage bar, reset countdowns, and live state changes such as `busy`, `idle`,
+`completed`, `attention`, `dizzy`, `heart`, and `sleep`.
+
+This project is a personal fork of Anthropic's
 [`claude-desktop-buddy`](https://github.com/anthropics/claude-desktop-buddy)
-reference firmware, focused on M5Stack StickS3, animated GIF pets, charging
-clock layouts, and a more desk-friendly visual experience.
+reference firmware. The BLE display idea comes from that reference project,
+but this fork is focused on Codex, M5Stack StickS3, GIF pets, and a local Codex
+usage bridge.
 
-The upstream project is a reference implementation for the BLE protocol
-described in [`REFERENCE.md`](REFERENCE.md). This fork keeps that protocol
-surface, but turns the firmware into a more opinionated StickS3 GIF-pet build.
+## Current Status
 
-## What This Fork Adds
+This is a working prototype.
 
-- BLE-friendly GIF playback pacing:
-  - disconnected: play one GIF loop, then pause for 5 seconds
-  - connected: play one GIF loop, then pause for 3 seconds
-- Last-frame hold between GIF loops to avoid black-frame flicker.
-- Landscape clock GIF playback that continues looping instead of stopping
-  after one pass.
-- Landscape GIF clipping fixes for StickS3.
-- Portrait charging clock layout tuned for GIF pets.
-- Token usage display in the charging clock, replacing the seconds display.
-- Battery landscape clock support while the screen is already awake.
-- Auto screen-off on battery is preserved.
-- M5Stack StickS3 PlatformIO environment pinned to `espressif32@6.7.0`.
+Tested:
 
-## Hardware Target
+- M5Stack StickS3 firmware build and upload.
+- BLE advertising as `Codex-XXXX`.
+- Codex usage packets sent from macOS to StickS3.
+- Portrait usage dashboard.
+- Landscape usage dashboard.
+- Landscape GIF rendering through a small canvas to avoid slow direct LCD
+  pixel drawing.
+- Local Codex plugin startup on `SessionStart` and `UserPromptSubmit`.
+- Hook diagnostics and bridge diagnostics.
 
-This fork is primarily tested with:
+Not included yet:
+
+- Real Codex approval/deny handling from the StickS3 buttons. The display
+  bridge is the supported path in this version.
+- A polished public pet-generation pipeline. GIF pet creation is still a work
+  in progress.
+
+## What It Displays
+
+- GIF pet area.
+- `CODEX USAGE` header with `LIVE` or `WAIT`.
+- Primary usage window labeled `5h`.
+- Secondary usage window labeled `7d`.
+- Reset countdowns for both windows.
+- Color-coded usage bars:
+  - `0-34%`: blue
+  - `35-69%`: green
+  - `70-100%`: orange
+
+Portrait mode places the pet above the usage bars. Landscape mode places the
+pet on the left and usage bars on the right.
+
+## Hardware
+
+Tested target:
 
 ```text
 M5Stack StickS3 / ESP32-S3
 ```
 
-The code still comes from the original ESP32/M5Unified firmware, but this fork
-is not intended to be a general board-support PR for upstream. It is a
-StickS3-focused variant.
+Firmware dependencies are managed by PlatformIO:
 
-## Features
+- M5Unified
+- M5GFX
+- AnimatedGIF
+- ArduinoJson
+- LittleFS
+- ESP32 BLE Arduino
 
-### GIF Pet Mode
-
-The device can receive a custom GIF character pack from the Claude Desktop
-Hardware Buddy window. The pack contains a `manifest.json` file and the GIFs
-referenced by that manifest.
-
-This fork tunes GIF playback to leave time for BLE advertising and data
-exchange, which is especially important while the device is waiting for Claude
-Desktop to connect or send permission events.
-
-### Charging Clock
-
-When the StickS3 is on USB power and idle, it shows a clock view.
-
-Portrait charging clock:
-
-- GIF pet at the top
-- large time display
-- today's token usage below the time
-- no date line
-
-Landscape charging clock:
-
-- GIF pet on the left
-- time, token usage, and date on the right
-
-### Battery Landscape Clock
-
-When running on battery, the screen-off behavior is unchanged. However, if the
-screen is already awake and the device is held sideways, this fork can show the
-landscape clock view.
-
-This means:
+## Repository Layout
 
 ```text
-battery + screen awake + landscape = landscape clock
-battery + idle timeout = screen turns off as usual
+src/
+  main.cpp          StickS3 UI, state machine, usage dashboard
+  character.cpp     GIF loading, playback pacing, rendering
+  character.h       GIF character API
+  ble_bridge.cpp    Nordic UART style BLE link
+  data.h            JSON packet parsing
+
+characters/
+  bufo/             Example GIF character pack
+
+tools/
+  codex_usage_ble_bridge.py
+                    Manual Codex usage BLE bridge
+
+plugins/
+  codex-usage-stick/
+    .codex-plugin/plugin.json
+    hooks.json
+    scripts/
+      hook_entry.py
+      start_bridge.py
+      codex_usage_ble_bridge.py
+    skills/
+      codex-usage-stick/SKILL.md
+
+.agents/plugins/marketplace.json
+                    Local Codex plugin marketplace entry
+
+docs/
+  USAGE.md          Full setup and troubleshooting guide
 ```
 
-## Build And Flash
+## Quick Start
 
-Install [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/),
-then clone this fork:
+For a full walkthrough, use [docs/USAGE.md](docs/USAGE.md).
+
+### 1. Build And Flash Firmware
 
 ```bash
 git clone https://github.com/openelab-commits/claude-desktop-buddy-GIF.git
 cd claude-desktop-buddy-GIF
-```
-
-Build the StickS3 firmware:
-
-```bash
 pio run -e m5stack-sticks3
-```
-
-Upload firmware:
-
-```bash
 pio run -e m5stack-sticks3 -t upload
 ```
 
-If you are starting from a previously flashed device, erase first:
+### 2. Upload A GIF Character Pack
+
+PlatformIO uploads LittleFS data from `data/`. This folder is ignored by git so
+you can freely swap local pets.
+
+To upload the included `bufo` character:
 
 ```bash
-pio run -e m5stack-sticks3 -t erase
-pio run -e m5stack-sticks3 -t upload
-```
-
-If you are uploading local LittleFS data over USB:
-
-```bash
+rm -rf data
+mkdir -p data/characters/bufo
+cp -R characters/bufo/* data/characters/bufo/
 pio run -e m5stack-sticks3 -t uploadfs
 ```
 
-## Pairing With Claude Desktop
+To upload your own pet folder:
 
-1. Enable developer mode in Claude Desktop:
+```bash
+rm -rf data
+mkdir -p data/characters/Mao
+cp -R /path/to/Mao/* data/characters/Mao/
+pio run -e m5stack-sticks3 -t uploadfs
+```
 
-   ```text
-   Help -> Troubleshooting -> Enable Developer Mode
-   ```
+Keep only one character folder under `data/characters/` when testing. The
+firmware loads the first character directory it finds.
 
-2. Open:
+### 3. Install The Codex Plugin
 
-   ```text
-   Developer -> Open Hardware Buddy...
-   ```
+Install Python BLE support:
 
-3. Click **Connect** and select the StickS3 device.
+```bash
+python3 -m pip install bleak
+```
 
-4. Grant Bluetooth permissions if macOS asks.
+In Codex, open:
 
-The device uses the same Nordic UART Service protocol as the upstream reference
-implementation.
+```text
+Settings -> Plugins -> Add plugin marketplace
+```
 
-## Controls
+Fill the dialog like this:
 
-| Button | Normal | Approval |
-| --- | --- | --- |
-| A | next screen | approve once |
-| B | scroll / next page | deny |
-| Hold A | menu | menu |
-| Power short press | toggle screen off | toggle screen off |
-| Power long press | hardware power off | hardware power off |
+```text
+Source:
+openelab-commits/claude-desktop-buddy-GIF
 
-The screen auto-powers-off after idle time on battery. USB power keeps the
-clock visible.
+Git ref:
+main
+
+Sparse path:
+leave empty
+```
+
+If you publish this under your own fork, use your own GitHub `owner/repo` in
+the `Source` field.
+
+Enable plugin hooks:
+
+```bash
+/Applications/Codex.app/Contents/Resources/codex features enable plugin_hooks
+```
+
+CLI fallback:
+
+```bash
+/Applications/Codex.app/Contents/Resources/codex plugin marketplace add openelab-commits/claude-desktop-buddy-GIF --ref main
+```
+
+If the plugin does not enable automatically, add this to `~/.codex/config.toml`:
+
+```toml
+[plugins."codex-usage-stick@codex-usage-stick-marketplace"]
+enabled = true
+```
+
+Restart Codex. When Codex asks whether to trust the hook, approve it. The hook
+starts a local BLE bridge; it does not send data to an external server.
+
+The plugin also includes a small Codex skill for status and troubleshooting.
+It is installed with the plugin; no separate skill installation is required.
+You can ask Codex to check the Codex Usage Stick bridge status after the plugin
+is enabled.
+
+### 4. Trigger The Bridge
+
+After Codex restarts, submit any prompt. The plugin hook should start the BLE
+bridge automatically.
+
+Check hook startup:
+
+```bash
+tail -n 20 ~/.codex/codex-usage-bridge/hook.log
+```
+
+You should see `UserPromptSubmit`.
+
+Check BLE packets:
+
+```bash
+tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
+```
+
+A healthy log contains lines like:
+
+```text
+sent {"state":"busy","tokens":...,"primary":...,"secondary":...}
+```
+
+## Packet Format
+
+The bridge sends compact JSON over BLE:
+
+```json
+{
+  "state": "busy",
+  "tokens": 57832,
+  "primary": 1,
+  "secondary": 16,
+  "primary_resets_at": 1778673005,
+  "secondary_resets_at": 1779159360,
+  "now": 1778671200
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `state` | Pet state: `busy`, `idle`, `completed`, `attention`, `dizzy`, `heart`, or `sleep` |
+| `tokens` | Total token usage value read by the bridge |
+| `primary` | 5-hour usage percentage |
+| `secondary` | 7-day usage percentage |
+| `primary_resets_at` | Unix timestamp for primary reset |
+| `secondary_resets_at` | Unix timestamp for secondary reset |
+| `now` | Sender timestamp |
 
 ## GIF Character Pack Format
 
-A GIF character pack is a folder containing `manifest.json` and the referenced
-GIF files.
+A character pack is a folder containing `manifest.json` and GIF files.
 
 Example:
 
 ```json
 {
-  "name": "Mili",
-  "colors": {
-    "body": "#FFFFFF",
-    "bg": "#000000",
-    "text": "#FFFFFF",
-    "textDim": "#808080",
-    "ink": "#000000"
-  },
+  "name": "Bufo",
   "states": {
     "sleep": "sleep.gif",
     "idle": ["idle_0.gif", "idle_1.gif"],
@@ -176,59 +272,36 @@ Example:
 }
 ```
 
-Recommended GIF guidance for this fork:
+Recommended source animation target:
 
-- Keep the character consistent across all states.
-- Use transparent backgrounds.
-- Keep the sprite tightly cropped.
-- Avoid shadows, speed lines, text, UI elements, and complex scenery.
-- Keep animations readable on the StickS3 screen.
-- Compress GIFs so the full character pack fits comfortably in LittleFS.
+- 144x156 frames.
+- Transparent background.
+- Consistent character design across all states.
+- No text, UI elements, shadows, or complex scenery inside the GIF.
+- Keep the pack small enough for LittleFS.
 
-## State Meanings
+## Troubleshooting
 
-| State | Intended use |
-| --- | --- |
-| `sleep` | Claude is not connected or the buddy is resting |
-| `idle` | connected and calm |
-| `busy` | Claude is actively working |
-| `attention` | a permission prompt is waiting |
-| `completed` | a task or action completed |
-| `celebrate` | success or level-up style reaction |
-| `dizzy` | shake / confused / error reaction |
-| `heart` | quick approval or affectionate reaction |
+Use the full guide in [docs/USAGE.md](docs/USAGE.md#troubleshooting).
 
-## Project Layout
+Common checks:
 
-```text
-src/
-  main.cpp        loop, state machine, UI, clock screens
-  character.cpp   GIF decode, playback pacing, rendering
-  character.h     GIF character API
-  ble_bridge.cpp  Nordic UART BLE bridge
-  data.h          JSON protocol parsing
-  xfer.h          folder push receiver
-  stats.h         settings and persistent stats
-characters/       example GIF character packs
-tools/            helper scripts
+```bash
+python3 plugins/codex-usage-stick/scripts/start_bridge.py --status
+tail -n 20 ~/.codex/codex-usage-bridge/hook.log
+tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
 ```
 
-## Relationship To Upstream
+If Codex shows a hook warning about async hooks, update to this version. The
+plugin hooks in this repo are synchronous and quickly start a background bridge.
 
-The upstream project is a reference implementation. This fork is a customized
-firmware variant for my M5Stack StickS3 workflow.
+## Credits
 
-If you are building a different device, read [`REFERENCE.md`](REFERENCE.md)
-first. The protocol is the stable contract; this firmware is one implementation
-of that protocol.
+Made by OpenELAB Cris.
 
-## Roadmap
-
-- Add a token usage progress bar.
-- Build a more targeted GIF generation workflow.
-- Create an image-based pet generation skill for producing matching GIF packs.
-- Improve documentation for flashing and custom character creation.
+Forked from the Claude Desktop Buddy reference firmware by Felix Rieseberg and
+Anthropic.
 
 ## License
 
-This fork keeps the upstream project license. See [`LICENSE`](LICENSE).
+This fork keeps the upstream project license. See [LICENSE](LICENSE).
