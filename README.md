@@ -15,7 +15,7 @@ usage bridge.
 
 <p align="center">
   <img src="docs/codex-usage-stick-landscape.jpeg" width="430" alt="Codex Usage Stick landscape dashboard">
-  <img src="docs/codex-usage-stick-portrait.jpeg" width="300" alt="Codex Usage Stick portrait dashboard">
+  <img src="docs/codex-usage-stick-portrait.jpeg" width="380" alt="Codex Usage Stick portrait dashboard">
 </p>
 
 ## What It Displays
@@ -35,18 +35,7 @@ pet on the left and usage bars on the right.
 
 ## Hardware
 
-<<<<<<< HEAD
-<<<<<<< Updated upstream
-The firmware targets ESP32 with the Arduino framework. As written, it
-depends on the M5StickCPlus library for its display, IMU, and button
-drivers—so you'll need that board, or a fork that swaps those drivers for
-your own pin layout.
-=======
 Tested target:
->>>>>>> Stashed changes
-=======
-Tested target:
->>>>>>> dea2aa848667d0c4260df44081c89926be4a3074
 
 ```text
 M5Stack StickS3 / ESP32-S3
@@ -152,14 +141,8 @@ enabled = true
 Restart Codex. When Codex asks whether to trust the hook, approve it. The hook
 starts a local BLE bridge; it does not send data to an external server.
 
-<<<<<<< HEAD
-The plugin also includes Codex skills for status/troubleshooting and seven-state
-pet spritesheet generation. They are installed with the plugin; no separate skill
-installation is required.
-=======
 The plugin also includes a small Codex skill for status and troubleshooting.
 It is installed with the plugin; no separate skill installation is required.
->>>>>>> dea2aa848667d0c4260df44081c89926be4a3074
 You can ask Codex to check the Codex Usage Stick bridge status after the plugin
 is enabled.
 
