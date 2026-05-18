@@ -14,8 +14,8 @@ but this fork is focused on Codex, M5Stack StickS3, GIF pets, and a local Codex
 usage bridge.
 
 <p align="center">
-  <img src="docs/codex-usage-stick-landscape.jpeg" width="430" alt="Codex Usage Stick landscape dashboard">
-  <img src="docs/codex-usage-stick-portrait.gif" width="430" alt="Codex Usage Stick portrait dashboard animation">
+  <img src="docs/codex-usage-stick-landscape.jpeg" height="360" alt="Codex Usage Stick landscape dashboard">
+  <img src="docs/codex-usage-stick-portrait.gif" height="360" alt="Codex Usage Stick portrait dashboard animation">
 </p>
 
 ## What It Displays
