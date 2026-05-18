@@ -46,8 +46,6 @@ openelab-commits/codex-desktop-buddy
 
 Git ref:
 main
-
-Sparse path:
 ```
 
 If this lives in your own fork, use your fork's `owner/repo`.

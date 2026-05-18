@@ -102,8 +102,6 @@ openelab-commits/codex-desktop-buddy
 
 Git ref:
 main
-
-Sparse path:
 ```
 
 If you publish this under your own fork, use your own GitHub `owner/repo` in
@@ -155,6 +153,31 @@ A healthy log contains lines like:
 ```text
 sent {"state":"busy","tokens":...,"primary":...,"secondary":...}
 ```
+
+### 5. Move The Stick To Another Computer
+
+The StickS3 connects over BLE, not Wi-Fi. To move the same StickS3 to another
+computer, first stop the bridge on the old computer or quit Codex:
+
+```bash
+cd codex-desktop-buddy
+python3 plugins/codex-usage-stick/scripts/start_bridge.py --stop
+```
+
+Then open Codex on the new computer, install and trust the plugin, and submit
+any prompt. The `UserPromptSubmit` hook starts the local BLE bridge and connects
+to the StickS3.
+
+If it does not connect, restart the StickS3 and check the new computer's bridge
+log:
+
+```bash
+tail -n 80 ~/.codex/codex-usage-bridge/bridge.log
+```
+
+A StickS3 should be connected to one computer at a time. If the old computer is
+still running the bridge, the new computer may see the device but fail to claim
+the BLE connection.
 
 ## Current Status
 
