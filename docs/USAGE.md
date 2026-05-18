@@ -107,14 +107,12 @@ openelab-commits/codex-desktop-buddy
 
 Git ref:
 main
-
-Sparse path:
 ```
 
 If you are using a fork, replace the source with your own GitHub `owner/repo`.
 
-The repo root contains `.agents/plugins/marketplace.json`, so no sparse path is
-needed.
+The repo root contains `.agents/plugins/marketplace.json`, so Codex can load the
+plugin marketplace directly from the repository root.
 
 ### CLI Fallback
 
