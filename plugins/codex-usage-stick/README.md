@@ -147,7 +147,20 @@ python3 plugins/codex-usage-stick/scripts/hook_entry.py --event ManualTest
 
 ## Verify
 
-After submitting a Codex prompt:
+Make sure Bluetooth is enabled on the computer.
+
+For the first BLE pairing on a new computer, start with a foreground `busy`
+test so macOS can show the pairing prompt:
+
+```bash
+python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0/scripts/codex_usage_ble_bridge.py --verbose --state busy
+```
+
+The StickS3 should show a pairing code. Enter that code on the computer to
+finish the BLE pairing. Once the hardware starts showing usage information,
+stop the foreground test with `Command-C` / `Ctrl-C`.
+
+Then submit a Codex prompt in a project where the plugin hook is trusted:
 
 ```bash
 tail -n 20 ~/.codex/codex-usage-bridge/hook.log

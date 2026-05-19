@@ -170,8 +170,21 @@ CLI fallback:
 
 ### 4. Trigger The Bridge
 
-After Codex restarts, submit any prompt. The plugin hook should start the BLE
-bridge automatically.
+After Codex restarts, make sure Bluetooth is enabled on the computer.
+
+For the first BLE pairing on a new computer, start with a foreground `busy`
+test so macOS can show the pairing prompt:
+
+```bash
+python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0/scripts/codex_usage_ble_bridge.py --verbose --state busy
+```
+
+The StickS3 should show a pairing code. Enter that code on the computer to
+finish the BLE pairing. Once the hardware starts showing usage information,
+stop the foreground test with `Command-C` / `Ctrl-C`.
+
+Then submit any prompt in a project where the plugin hook is trusted. The
+plugin hook should start the BLE bridge automatically.
 
 Check hook startup:
 
