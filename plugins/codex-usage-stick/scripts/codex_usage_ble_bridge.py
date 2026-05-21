@@ -37,6 +37,8 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_APP_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
 STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
 DEFAULT_HOOK_APPROVAL_SOCK = STATE_DIR / "approval.sock"
+PRIMARY_RESET_WINDOW_SEC = 5 * 60 * 60
+SECONDARY_RESET_WINDOW_SEC = 7 * 24 * 60 * 60
 
 INTERESTING_LINE_MARKERS = (
     "token_count",
@@ -146,15 +148,23 @@ class UsageSnapshot:
     last_activity_at: float | None = None
 
     def packet(self, state: str) -> dict[str, Any]:
+        now = int(time.time())
         return {
             "state": state,
             "tokens": self.tokens,
             "primary": self.primary,
             "secondary": self.secondary,
-            "primary_resets_at": self.primary_resets_at,
-            "secondary_resets_at": self.secondary_resets_at,
-            "now": int(time.time()),
+            "primary_resets_at": roll_reset_at(self.primary_resets_at, PRIMARY_RESET_WINDOW_SEC, now),
+            "secondary_resets_at": roll_reset_at(self.secondary_resets_at, SECONDARY_RESET_WINDOW_SEC, now),
+            "now": now,
         }
+
+
+def roll_reset_at(reset_at: int, window_sec: int, now: int) -> int:
+    if reset_at <= 0 or window_sec <= 0 or reset_at > now:
+        return reset_at
+    windows_elapsed = (now - reset_at) // window_sec + 1
+    return reset_at + windows_elapsed * window_sec
 
 
 def clamp_percent(value: Any) -> int:

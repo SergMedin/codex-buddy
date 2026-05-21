@@ -55,6 +55,12 @@ bool    menuOpen    = false;
 uint8_t menuSel     = 0;
 uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
 bool    btnALong    = false;
+const uint16_t BUTTON_STABLE_MS = 40;
+bool    btnAStablePress = false;
+bool    btnBStablePress = false;
+bool    btnBHandled     = false;
+uint32_t btnADownMs     = 0;
+uint32_t btnBDownMs     = 0;
 
 enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
@@ -1365,6 +1371,28 @@ void loop() {
   t++;
   uint32_t now = millis();
 
+  if (M5.BtnA.wasPressed()) {
+    btnADownMs = now;
+    btnAStablePress = false;
+  }
+  if (M5.BtnA.isPressed()) {
+    if (btnADownMs == 0) btnADownMs = now;
+    if (!btnAStablePress && (uint32_t)(now - btnADownMs) >= BUTTON_STABLE_MS) {
+      btnAStablePress = true;
+    }
+  }
+  if (M5.BtnB.wasPressed()) {
+    btnBDownMs = now;
+    btnBStablePress = false;
+    btnBHandled = false;
+  }
+  if (M5.BtnB.isPressed()) {
+    if (btnBDownMs == 0) btnBDownMs = now;
+    if (!btnBStablePress && (uint32_t)(now - btnBDownMs) >= BUTTON_STABLE_MS) {
+      btnBStablePress = true;
+    }
+  }
+
   dataPoll(&tama);
   if (statsPollLevelUp()) triggerOneShot(P_COMPLETED, 3000);
   baseState = derive(tama);
@@ -1444,7 +1472,7 @@ void loop() {
     }
   }
 
-  if (M5.BtnA.pressedFor(600) && !btnALong && !swallowBtnA) {
+  if (btnAStablePress && M5.BtnA.pressedFor(600) && !btnALong && !swallowBtnA) {
     btnALong = true;
     beep(800, 60);
     if (resetOpen) { resetOpen = false; }
@@ -1457,7 +1485,7 @@ void loop() {
     Serial.println(menuOpen ? "menu open" : "menu close");
   }
   if (M5.BtnA.wasReleased()) {
-    if (!btnALong && !swallowBtnA) {
+    if (btnAStablePress && !btnALong && !swallowBtnA) {
       if (inPrompt) {
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"accept\"}", tama.promptId);
@@ -1485,10 +1513,13 @@ void loop() {
     }
     btnALong = false;
     swallowBtnA = false;
+    btnADownMs = 0;
+    btnAStablePress = false;
   }
 
   // BtnB: pet → heart
-  if (M5.BtnB.wasPressed()) {
+  if (btnBStablePress && !btnBHandled) {
+    btnBHandled = true;
     if (swallowBtnB) { swallowBtnB = false; }
     else
     if (inPrompt) {
@@ -1518,6 +1549,11 @@ void loop() {
       beep(2400, 30);
       triggerOneShot(P_HEART, 2000);
     }
+  }
+  if (M5.BtnB.wasReleased()) {
+    btnBDownMs = 0;
+    btnBStablePress = false;
+    btnBHandled = false;
   }
 
   // blink bookkeeping
