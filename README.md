@@ -44,6 +44,7 @@ M5Stack StickS3 / ESP32-S3
 ## Quick Start
 
 For a full walkthrough, use [docs/USAGE.md](docs/USAGE.md).
+Remember to install PlatformIO before building or flashing the firmware.
 
 ### 1. Build And Flash Firmware
 
@@ -54,6 +55,10 @@ pio run -e m5stack-sticks3
 pio run -e m5stack-sticks3 -t upload
 pio run -e m5stack-sticks3 -t uploadfs
 ```
+
+When flashing firmware or uploading filesystem data, hold the lower-left side
+button to enter flashing mode. Short-press twice to power off, and short-press
+once to power on.
 
 ### 2. Install The Codex Plugin
 
