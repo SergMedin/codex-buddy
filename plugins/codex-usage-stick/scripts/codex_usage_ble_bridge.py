@@ -1205,14 +1205,12 @@ async def send_usage_update(
     ble: BleSession | None = None,
     approvals: CodexApprovalProxy | None = None,
 ) -> None:
-    if approvals and approvals.has_pending():
-        return
-
     snapshot = await asyncio.to_thread(read_usage, args)
-    if approvals and approvals.has_pending():
-        return
 
     state = choose_state(args, snapshot, tracker)
+    if approvals and approvals.has_pending():
+        state = "attention"
+
     packet = snapshot.packet(state)
     line = json.dumps(packet, separators=(",", ":"))
 
