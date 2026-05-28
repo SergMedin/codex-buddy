@@ -105,6 +105,8 @@ const uint32_t SCREEN_OFF_MS = 30000;
 bool     napping = false;
 uint32_t napStartMs = 0;
 uint32_t promptArrivedMs = 0;
+const uint32_t HOUR_SEC = 3600;
+const uint32_t DAY_SEC = 86400;
 
 // Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
 static bool isFaceDown() {
@@ -1065,6 +1067,24 @@ static uint16_t usageColor(uint8_t pct, const Palette& p) {
   return 0x04DF;
 }
 
+static uint16_t resetColor(uint32_t resetAt, const char* windowLabel, bool live, const Palette& p) {
+  uint32_t now = 0;
+  if (!live || resetAt == 0 || !dataUtcNow(&now)) return p.textDim;
+
+  uint32_t left = resetAt > now ? resetAt - now : 0;
+  if (left == 0) return HOT;
+
+  if (strcmp(windowLabel, "7d") == 0) {
+    if (left > 4 * DAY_SEC) return GREEN;
+    if (left > 2 * DAY_SEC) return 0xFD20;
+    return HOT;
+  }
+
+  if (left > 3 * HOUR_SEC) return GREEN;
+  if (left > HOUR_SEC) return 0xFD20;
+  return HOT;
+}
+
 static void resetText(uint32_t resetAt, char* out, size_t len) {
   uint32_t now = 0;
   if (resetAt == 0 || !dataUtcNow(&now)) {
@@ -1090,6 +1110,31 @@ static void resetText(uint32_t resetAt, char* out, size_t len) {
   }
 }
 
+static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
+  uint32_t now = 0;
+  if (resetAt == 0 || !dataUtcNow(&now)) {
+    out[0] = 0;
+    return;
+  }
+
+  uint32_t left = resetAt > now ? resetAt - now : 0;
+  if (left == 0) {
+    out[0] = 0;
+    return;
+  }
+  if (left >= 86400) {
+    snprintf(out, len, "%lud %02luh",
+             (unsigned long)(left / 86400),
+             (unsigned long)((left / 3600) % 24));
+  } else if (left >= 3600) {
+    snprintf(out, len, "%luh %02lum",
+             (unsigned long)(left / 3600),
+             (unsigned long)((left / 60) % 60));
+  } else {
+    snprintf(out, len, "%lum", (unsigned long)(left / 60));
+  }
+}
+
 static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
                              uint8_t pct, const char* windowLabel,
                              uint32_t resetAt, bool live, const Palette& p) {
@@ -1111,12 +1156,27 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
   int fw = (int)((uint32_t)(bw - 2) * pct / 100);
   if (fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
 
-  char r[24];
-  resetText(resetAt, r, sizeof(r));
   dst->setTextSize(1);
   dst->setTextDatum(TL_DATUM);
-  dst->setTextColor(live ? p.textDim : p.textDim, p.bg);
-  dst->drawString(r, x, y + 44);
+  if (live && resetAt != 0) {
+    uint32_t now = 0;
+    char rt[12];
+    resetTimeText(resetAt, rt, sizeof(rt));
+    if (dataUtcNow(&now) && resetAt > now && rt[0]) {
+      const char* prefix = "resets in ";
+      dst->setTextColor(p.textDim, p.bg);
+      dst->drawString(prefix, x, y + 44);
+      int prefixW = dst->textWidth(prefix);
+      dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
+      dst->drawString(rt, x + prefixW, y + 44);
+    } else {
+      dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
+      dst->drawString("reset soon", x, y + 44);
+    }
+  } else {
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString("resets --", x, y + 44);
+  }
 }
 
 static void drawUsageMeter(int y, uint8_t pct, const char* windowLabel,
