@@ -29,6 +29,9 @@ usage bridge.
   - `0-34%`: blue
   - `35-69%`: green
   - `70-100%`: orange
+- Color-coded reset time values:
+  - `5h`: green above 3h, orange above 1h, red at 1h or below
+  - `7d`: green above 4d, orange above 2d, red at 2d or below
 
 Portrait mode places the pet above the usage bars. Landscape mode places the
 pet on the left and usage bars on the right.
