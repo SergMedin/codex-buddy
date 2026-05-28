@@ -97,6 +97,17 @@ Choose `Codex Usage Stick Local` and add it.
 If you publish this under your own fork, use your own GitHub `owner/repo` in
 the `Source` field.
 
+Open a new Codex window, type `$codex-usage-stick`, choose the plugin skill,
+and send this prompt:
+
+```text
+Help me enable hooks and generate three corresponding hooks: SessionStart, UserPromptSubmit, and PermissionRequest. They need to be triggered both inside and outside the project.
+```
+
+Codex should create the three hooks that start the BLE bridge.
+
+CLI fallback:
+
 Make plugin_hooks = true on bash:
 
 ```bash
@@ -143,8 +154,6 @@ Restart Codex. When Codex asks whether to trust the hooks, approve them. The
 hooks start a local BLE bridge and forward permission prompts to the StickS3;
 they do not send data to an external server.
 
-CLI fallback:
-
 ```bash
 /Applications/Codex.app/Contents/Resources/codex plugin marketplace add openelab-commits/codex-desktop-buddy --ref main
 ```
@@ -152,6 +161,10 @@ CLI fallback:
 ### 3. Trigger The Bridge
 
 After Codex restarts, make sure Bluetooth is enabled on the computer.
+Send any message in Codex. Codex will try to connect to the hardware and the
+StickS3 should show a pairing code.
+
+CLI fallback:
 
 For the first BLE pairing on a new computer, start with a foreground `busy`
 test so macOS can show the pairing prompt:
