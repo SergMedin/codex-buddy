@@ -1,6 +1,6 @@
-# Codex Usage Stick
+# Codexmeter
 
-Codex Usage Stick is a prototype firmware and local Codex plugin for turning an
+Codexmeter is a prototype firmware and local Codex plugin for turning an
 M5Stack StickS3 into a small desktop usage monitor.
 
 The StickS3 shows Codex usage over BLE: a GIF pet, a 5-hour usage bar, a 7-day
