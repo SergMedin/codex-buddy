@@ -1,7 +1,7 @@
-# Codexmeter
+# Codex Buddy
 
-Codexmeter is a prototype firmware and local Codex plugin for turning an
-M5Stack StickS3 into a small desktop usage monitor.
+Codex Buddy turns an M5Stack StickS3 into a desktop companion for Codex usage, live states, and animated GIF pets.
+It pairs firmware with a local Codex bridge so the device can show usage bars, reset countdowns, and live work-state animations over BLE.
 
 The StickS3 shows Codex usage over BLE: a GIF pet, a 5-hour usage bar, a 7-day
 usage bar, reset countdowns, and live state changes such as `busy`, `idle`,
@@ -52,8 +52,8 @@ Remember to install PlatformIO before building or flashing the firmware.
 ### 1. Build And Flash Firmware
 
 ```bash
-git clone https://github.com/openelab-commits/codex-desktop-buddy.git
-cd codex-desktop-buddy
+git clone https://github.com/openelab-commits/codex-buddy.git
+cd codex-buddy
 pio run -e m5stack-sticks3
 pio run -e m5stack-sticks3 -t upload
 pio run -e m5stack-sticks3 -t uploadfs
@@ -81,7 +81,7 @@ Fill the dialog like this:
 
 ```text
 Source:
-openelab-commits/codex-desktop-buddy
+openelab-commits/codex-buddy
 
 Git ref:
 main
@@ -158,7 +158,7 @@ hooks start a local BLE bridge and forward permission prompts to the StickS3;
 they do not send data to an external server.
 
 ```bash
-/Applications/Codex.app/Contents/Resources/codex plugin marketplace add openelab-commits/codex-desktop-buddy --ref main
+/Applications/Codex.app/Contents/Resources/codex plugin marketplace add openelab-commits/codex-buddy --ref main
 ```
 
 ### 3. Trigger The Bridge
@@ -213,7 +213,7 @@ The StickS3 connects over BLE, not Wi-Fi. To move the same StickS3 to another
 computer, first stop the bridge on the old computer or quit Codex:
 
 ```bash
-cd codex-desktop-buddy
+cd codex-buddy
 python3 plugins/codex-usage-stick/scripts/start_bridge.py --stop
 ```
 
@@ -319,10 +319,10 @@ Example:
 Place character folders under `data/characters/`, for example:
 
 ```text
-codex-desktop-buddy/data/characters/Mao/
+codex-buddy/data/characters/Mao/
 ```
 
-To update the pet assets, open Terminal in the `codex-desktop-buddy` directory
+To update the pet assets, open Terminal in the `codex-buddy` directory
 and run:
 
 ```bash
