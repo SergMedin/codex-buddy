@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import signal
@@ -16,18 +17,25 @@ from typing import Any
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_SCRIPT = PLUGIN_ROOT / "scripts" / "codex_usage_ble_bridge.py"
-STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
+DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+STATE_DIR = DEFAULT_CODEX_HOME / "codex-usage-bridge"
 CONFIG_PATH = STATE_DIR / "config.json"
 PID_PATH = STATE_DIR / "bridge.pid"
+CHILD_PID_PATH = STATE_DIR / "bridge.child.pid"
+HEARTBEAT_PATH = STATE_DIR / "bridge.heartbeat"
 LOG_PATH = STATE_DIR / "bridge.log"
 HOOK_LOG_PATH = STATE_DIR / "hook.log"
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "codex_home": str(DEFAULT_CODEX_HOME),
     "name": "Codex-",
     "address": None,
     "interval": 5.0,
     "scan_timeout": 8.0,
     "restart_delay": 5.0,
+    "heartbeat_timeout": 90.0,
+    "ble_write_timeout": 8.0,
+    "update_timeout": 20.0,
     "verbose": True,
     "no_approval_proxy": True,
 }
@@ -37,13 +45,21 @@ SHUTDOWN = False
 
 def ensure_state_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o700)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
 
 
 def load_config() -> dict[str, Any]:
     ensure_state_dir()
     if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+        write_private_text(CONFIG_PATH, json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
         return dict(DEFAULT_CONFIG)
+    with contextlib.suppress(OSError):
+        CONFIG_PATH.chmod(0o600)
     try:
         loaded = json.loads(CONFIG_PATH.read_text())
     except json.JSONDecodeError:
@@ -82,6 +98,9 @@ def running_pid() -> int | None:
 
 def bridge_command(cfg: dict[str, Any]) -> list[str]:
     cmd = [sys.executable, str(BRIDGE_SCRIPT)]
+    codex_home = cfg.get("codex_home")
+    if codex_home:
+        cmd.extend(["--codex-home", str(codex_home)])
     name = cfg.get("name")
     if name:
         cmd.extend(["--name", str(name)])
@@ -92,11 +111,23 @@ def bridge_command(cfg: dict[str, Any]) -> list[str]:
         cmd.extend(["--interval", str(cfg["interval"])])
     if cfg.get("scan_timeout") is not None:
         cmd.extend(["--scan-timeout", str(cfg["scan_timeout"])])
+    if cfg.get("update_timeout") is not None:
+        cmd.extend(["--update-timeout", str(cfg["update_timeout"])])
+    if cfg.get("ble_write_timeout") is not None:
+        cmd.extend(["--ble-write-timeout", str(cfg["ble_write_timeout"])])
+    cmd.extend(["--heartbeat-path", str(HEARTBEAT_PATH)])
     if cfg.get("verbose", True):
         cmd.append("--verbose")
     if cfg.get("no_approval_proxy", True):
         cmd.append("--no-approval-proxy")
     return cmd
+
+
+def bridge_env(cfg: dict[str, Any]) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["CODEX_HOME"] = str(Path(str(cfg.get("codex_home") or DEFAULT_CODEX_HOME)).expanduser())
+    return env
 
 
 def supervisor_command() -> list[str]:
@@ -114,7 +145,12 @@ def supervise_bridge() -> int:
 
     while not SHUTDOWN:
         cfg = load_config()
-        proc = subprocess.Popen(bridge_command(cfg), cwd=str(PLUGIN_ROOT))
+        with contextlib.suppress(FileNotFoundError):
+            HEARTBEAT_PATH.unlink()
+        proc = subprocess.Popen(bridge_command(cfg), cwd=str(PLUGIN_ROOT), env=bridge_env(cfg))
+        write_private_text(CHILD_PID_PATH, f"{proc.pid}\n")
+        started_at = time.time()
+        heartbeat_timeout = float(cfg.get("heartbeat_timeout", 90.0) or 90.0)
         while proc.poll() is None:
             if SHUTDOWN:
                 proc.terminate()
@@ -123,7 +159,27 @@ def supervise_bridge() -> int:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 break
+            if heartbeat_timeout > 0:
+                try:
+                    heartbeat_age = time.time() - HEARTBEAT_PATH.stat().st_mtime
+                    stale = heartbeat_age > heartbeat_timeout
+                except FileNotFoundError:
+                    heartbeat_age = time.time() - started_at
+                    stale = heartbeat_age > heartbeat_timeout
+                if stale:
+                    print(
+                        f"[supervisor] bridge heartbeat stale for {heartbeat_age:.0f}s; restarting pid {proc.pid}",
+                        flush=True,
+                    )
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    break
             time.sleep(1)
+        with contextlib.suppress(FileNotFoundError):
+            CHILD_PID_PATH.unlink()
         if not SHUTDOWN:
             delay = float(cfg.get("restart_delay", 5.0) or 5.0)
             time.sleep(max(1.0, delay))
@@ -136,16 +192,15 @@ def start_bridge(foreground: bool = False) -> int:
         return 2
 
     if foreground:
-        return subprocess.call(bridge_command(cfg), cwd=str(PLUGIN_ROOT))
+        return subprocess.call(bridge_command(cfg), cwd=str(PLUGIN_ROOT), env=bridge_env(cfg))
 
     pid = running_pid()
     if pid is not None:
         return 0
 
     ensure_state_dir()
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
     with LOG_PATH.open("ab") as log:
+        LOG_PATH.chmod(0o600)
         proc = subprocess.Popen(
             supervisor_command(),
             cwd=str(PLUGIN_ROOT),
@@ -153,22 +208,36 @@ def start_bridge(foreground: bool = False) -> int:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-            env=env,
+            env=bridge_env(cfg),
         )
-    PID_PATH.write_text(f"{proc.pid}\n")
+    write_private_text(PID_PATH, f"{proc.pid}\n")
     return 0
+
+
+def child_pid() -> int | None:
+    try:
+        pid = int(CHILD_PID_PATH.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if process_alive(pid) else None
 
 
 def stop_bridge() -> int:
     pid = running_pid()
-    if pid is None:
-        return 0
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    child = child_pid()
+    for target in (pid, child):
+        if target is None:
+            continue
+        try:
+            os.kill(target, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     try:
         PID_PATH.unlink()
+    except OSError:
+        pass
+    try:
+        CHILD_PID_PATH.unlink()
     except OSError:
         pass
     return 0
@@ -177,10 +246,18 @@ def stop_bridge() -> int:
 def status() -> int:
     cfg = load_config()
     pid = running_pid()
+    child = child_pid()
+    try:
+        heartbeat_age = round(time.time() - HEARTBEAT_PATH.stat().st_mtime, 1)
+    except FileNotFoundError:
+        heartbeat_age = None
     state = "running" if pid is not None else "stopped"
     print(json.dumps({
         "state": state,
         "pid": pid,
+        "child_pid": child,
+        "heartbeat": str(HEARTBEAT_PATH),
+        "heartbeat_age_sec": heartbeat_age,
         "config": str(CONFIG_PATH),
         "log": str(LOG_PATH),
         "hook_log": str(HOOK_LOG_PATH),

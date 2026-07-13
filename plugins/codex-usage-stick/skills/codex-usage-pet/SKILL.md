@@ -1,6 +1,6 @@
 ---
 name: codex-usage-pet
-description: Create, validate, preview, and package Codex Usage Stick pet spritesheets with seven hardware states: busy, idle, completed, attention, dizzy, heart, and sleep. Use when the user wants a StickS3/Codex Usage pet that outputs pet.json and spritesheet.webp instead of separate GIF files.
+description: "Create, validate, preview, and package Codex Usage Stick pet spritesheets with seven hardware states: busy, idle, completed, attention, dizzy, heart, and sleep. Use when the user wants a StickS3/Codex Usage pet that outputs pet.json and spritesheet.webp instead of separate GIF files."
 ---
 
 # Codex Usage Pet
@@ -79,7 +79,7 @@ Do not draw large detached sprite components, distant symbols, loose sparkles, g
 1. Prepare the run:
 
 ```bash
-SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0/skills/codex-usage-pet"
+SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0+codex.20260708104734/skills/codex-usage-pet"
 python "$SKILL_DIR/scripts/prepare_pet_run.py" \
   --pet-name "<Name>" \
   --description "<one sentence>" \

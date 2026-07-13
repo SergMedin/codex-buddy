@@ -238,24 +238,30 @@ python3 tools/codex_usage_ble_bridge.py --verbose --no-approval-proxy
 The first bridge start creates:
 
 ```text
-~/.codex/codex-usage-bridge/config.json
+${CODEX_HOME:-~/.codex}/codex-usage-bridge/config.json
 ```
 
 Default config:
 
 ```json
 {
+  "codex_home": "~/.codex",
   "name": "Codex-",
   "address": null,
   "interval": 5.0,
   "scan_timeout": 8.0,
   "restart_delay": 5.0,
+  "heartbeat_timeout": 90.0,
+  "ble_write_timeout": 8.0,
+  "update_timeout": 20.0,
   "verbose": true,
   "no_approval_proxy": true
 }
 ```
 
 Use `address` if macOS keeps showing a stale cached BLE name.
+Use `heartbeat_timeout` and the write/update timeouts to recover automatically
+from BLE or app-server calls that hang without exiting.
 
 ## Troubleshooting
 
@@ -346,9 +352,9 @@ Before publishing a new GitHub version:
 ```bash
 pio run -e m5stack-sticks3
 python3 -m json.tool plugins/codex-usage-stick/.codex-plugin/plugin.json >/dev/null
-python3 -m json.tool plugins/codex-usage-stick/hooks.json >/dev/null
+python3 -m json.tool plugins/codex-usage-stick/hooks/hooks.json >/dev/null
 python3 -m json.tool .agents/plugins/marketplace.json >/dev/null
 python3 -m py_compile plugins/codex-usage-stick/scripts/*.py tools/codex_usage_ble_bridge.py
 ```
 
-Also confirm no local-only paths are present in `plugins/codex-usage-stick/hooks.json`.
+Also confirm no local-only paths are present in `plugins/codex-usage-stick/hooks/hooks.json`.

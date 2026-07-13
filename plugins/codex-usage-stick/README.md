@@ -8,7 +8,7 @@ The plugin is local-first:
 - It reads local Codex usage files.
 - It starts one background bridge process.
 - It sends compact usage packets over BLE.
-- It writes diagnostics under `~/.codex/codex-usage-bridge/`.
+- It writes diagnostics under `${CODEX_HOME:-~/.codex}/codex-usage-bridge/`.
 - It does not send data to an external server.
 
 ## Hooks
@@ -91,10 +91,12 @@ python3 -m pip install bleak
 ## Runtime Files
 
 ```text
-~/.codex/codex-usage-bridge/config.json
-~/.codex/codex-usage-bridge/hook.log
-~/.codex/codex-usage-bridge/bridge.log
-~/.codex/codex-usage-bridge/bridge.pid
+${CODEX_HOME:-~/.codex}/codex-usage-bridge/config.json
+${CODEX_HOME:-~/.codex}/codex-usage-bridge/hook.log
+${CODEX_HOME:-~/.codex}/codex-usage-bridge/bridge.log
+${CODEX_HOME:-~/.codex}/codex-usage-bridge/bridge.pid
+${CODEX_HOME:-~/.codex}/codex-usage-bridge/bridge.child.pid
+${CODEX_HOME:-~/.codex}/codex-usage-bridge/bridge.heartbeat
 ```
 
 ## Config
@@ -103,17 +105,23 @@ Default `config.json`:
 
 ```json
 {
+  "codex_home": "~/.codex",
   "name": "Codex-",
   "address": null,
   "interval": 5.0,
   "scan_timeout": 8.0,
   "restart_delay": 5.0,
+  "heartbeat_timeout": 90.0,
+  "ble_write_timeout": 8.0,
+  "update_timeout": 20.0,
   "verbose": true,
   "no_approval_proxy": true
 }
 ```
 
 Use `address` if macOS BLE name caching makes name scanning unreliable.
+`heartbeat_timeout` lets the supervisor restart a bridge process that is alive
+but no longer sending usage updates.
 `no_approval_proxy` only disables the older app-server proxy experiment.
 StickS3 approve/deny uses the `PermissionRequest` hook plus the local
 `approval.sock` bridge and works with this value set to `true`.
@@ -158,7 +166,7 @@ For the first BLE pairing on a new computer, start with a foreground `busy`
 test so macOS can show the pairing prompt:
 
 ```bash
-python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0/scripts/codex_usage_ble_bridge.py --verbose --state busy
+python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0+codex.20260708104734/scripts/codex_usage_ble_bridge.py --verbose --state busy
 ```
 
 The StickS3 should show a pairing code. Enter that code on the computer to
