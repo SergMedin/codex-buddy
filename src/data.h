@@ -13,6 +13,8 @@ struct TamaState {
   uint32_t codexTokens;
   uint8_t  codexPrimary;
   uint8_t  codexSecondary;
+  bool     codexPrimaryAvailable;
+  bool     codexSecondaryAvailable;
   uint32_t codexPrimaryResetsAt;
   uint32_t codexSecondaryResetsAt;
   char     codexState[16];
@@ -145,10 +147,24 @@ static void _applyJson(const char* line, TamaState* out) {
       out->codexTokens = doc["tokens"].as<uint32_t>();
       out->tokensToday = out->codexTokens;
     }
-    out->codexPrimary = _jsonPct(doc["primary"], out->codexPrimary);
-    out->codexSecondary = _jsonPct(doc["secondary"], out->codexSecondary);
-    out->codexPrimaryResetsAt = doc["primary_resets_at"] | out->codexPrimaryResetsAt;
-    out->codexSecondaryResetsAt = doc["secondary_resets_at"] | out->codexSecondaryResetsAt;
+    // Each bridge packet is a full quota snapshot. Missing fields mean that
+    // OpenAI is not currently reporting that window, not that its usage is 0%.
+    bool hasPrimary = doc["primary"].is<int>()
+                   && doc["primary_resets_at"].is<uint32_t>()
+                   && doc["primary_resets_at"].as<uint32_t>() > 0;
+    bool hasSecondary = doc["secondary"].is<int>()
+                     && doc["secondary_resets_at"].is<uint32_t>()
+                     && doc["secondary_resets_at"].as<uint32_t>() > 0;
+    out->codexPrimaryAvailable = hasPrimary;
+    out->codexSecondaryAvailable = hasSecondary;
+    if (hasPrimary) {
+      out->codexPrimary = _jsonPct(doc["primary"], out->codexPrimary);
+      out->codexPrimaryResetsAt = doc["primary_resets_at"].as<uint32_t>();
+    }
+    if (hasSecondary) {
+      out->codexSecondary = _jsonPct(doc["secondary"], out->codexSecondary);
+      out->codexSecondaryResetsAt = doc["secondary_resets_at"].as<uint32_t>();
+    }
 
     out->sessionsRunning = strcmp(out->codexState, "busy") == 0 ? 1 : 0;
     out->sessionsWaiting = strcmp(out->codexState, "attention") == 0 ? 1 : 0;
@@ -222,6 +238,7 @@ inline void dataPoll(TamaState* out) {
     out->sessionsTotal=s.t; out->sessionsRunning=s.r; out->sessionsWaiting=s.w;
     out->recentlyCompleted=s.c; out->tokensToday=s.tok; out->lastUpdated=now;
     out->codexTokens=s.tok; out->codexPrimary=s.p; out->codexSecondary=s.s;
+    out->codexPrimaryAvailable=true; out->codexSecondaryAvailable=true;
     if (_utcEpochAtSync == 0) dataSyncUtc(now / 1000);
     uint32_t utcNow = 0;
     if (dataUtcNow(&utcNow)) {

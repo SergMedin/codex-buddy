@@ -747,8 +747,10 @@ void drawInfo() {
     _infoHeader(p, y, "CODEX", infoPage);
     spr.setTextColor(p.textDim, p.bg);
     ln("  tokens    %lu", (unsigned long)tama.codexTokens);
-    ln("  primary   %u%%", tama.codexPrimary);
-    ln("  secondary %u%%", tama.codexSecondary);
+    if (tama.codexPrimaryAvailable) ln("  primary   %u%%", tama.codexPrimary);
+    else                            ln("  primary   --");
+    if (tama.codexSecondaryAvailable) ln("  secondary %u%%", tama.codexSecondary);
+    else                              ln("  secondary --");
     y += 8;
     spr.setTextColor(p.text, p.bg);
     ln("LINK");
@@ -1137,15 +1139,18 @@ static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
 
 static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
                              uint8_t pct, const char* windowLabel,
-                             uint32_t resetAt, bool live, const Palette& p) {
+                             uint32_t resetAt, bool live, bool available,
+                             const Palette& p) {
   if (pct > 100) pct = 100;
-  uint16_t fill = live ? usageColor(pct, p) : p.textDim;
+  bool active = live && available;
+  uint16_t fill = active ? usageColor(pct, p) : p.textDim;
   char left[8];
-  snprintf(left, sizeof(left), "%u%%", pct);
+  if (active) snprintf(left, sizeof(left), "%u%%", pct);
+  else strncpy(left, "--", sizeof(left));
 
   dst->setTextSize(2);
   dst->setTextDatum(TL_DATUM);
-  dst->setTextColor(live ? p.text : p.textDim, p.bg);
+  dst->setTextColor(active ? p.text : p.textDim, p.bg);
   dst->drawString(left, x, y);
   dst->setTextDatum(TR_DATUM);
   dst->drawString(windowLabel, x + w, y);
@@ -1154,11 +1159,11 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
   dst->drawRect(bx, by, bw, bh, p.textDim);
   dst->fillRect(bx + 1, by + 1, bw - 2, bh - 2, p.bg);
   int fw = (int)((uint32_t)(bw - 2) * pct / 100);
-  if (fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
+  if (active && fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
 
   dst->setTextSize(1);
   dst->setTextDatum(TL_DATUM);
-  if (live && resetAt != 0) {
+  if (active && resetAt != 0) {
     uint32_t now = 0;
     char rt[12];
     resetTimeText(resetAt, rt, sizeof(rt));
@@ -1173,6 +1178,9 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
       dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
       dst->drawString("reset soon", x, y + 44);
     }
+  } else if (live && !available) {
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString("not reported", x, y + 44);
   } else {
     dst->setTextColor(p.textDim, p.bg);
     dst->drawString("resets --", x, y + 44);
@@ -1180,8 +1188,10 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
 }
 
 static void drawUsageMeter(int y, uint8_t pct, const char* windowLabel,
-                           uint32_t resetAt, bool live, const Palette& p) {
-  drawUsageMeterOn(&spr, 8, y, W - 16, pct, windowLabel, resetAt, live, p);
+                           uint32_t resetAt, bool live, bool available,
+                           const Palette& p) {
+  drawUsageMeterOn(&spr, 8, y, W - 16, pct, windowLabel, resetAt,
+                   live, available, p);
 }
 
 static void drawUsageDashboard() {
@@ -1221,8 +1231,10 @@ static void drawUsageDashboard() {
     spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
   }
 
-  drawUsageMeter(122, primary, "5h", live ? tama.codexPrimaryResetsAt : 0, live, p);
-  drawUsageMeter(184, secondary, "7d", live ? tama.codexSecondaryResetsAt : 0, live, p);
+  drawUsageMeter(122, primary, "5h", live ? tama.codexPrimaryResetsAt : 0,
+                 live, tama.codexPrimaryAvailable, p);
+  drawUsageMeter(184, secondary, "7d", live ? tama.codexSecondaryResetsAt : 0,
+                 live, tama.codexSecondaryAvailable, p);
 
   spr.setTextDatum(TL_DATUM);
 }
@@ -1234,6 +1246,8 @@ static void drawUsageDashboardLandscape() {
   uint8_t secondary = live ? tama.codexSecondary : 0;
   uint32_t primaryReset = live ? tama.codexPrimaryResetsAt : 0;
   uint32_t secondaryReset = live ? tama.codexSecondaryResetsAt : 0;
+  bool primaryAvailable = tama.codexPrimaryAvailable;
+  bool secondaryAvailable = tama.codexSecondaryAvailable;
 
   if (!usageLiveKnown || usageLastLive != live) {
     usageLiveKnown = true;
@@ -1259,6 +1273,8 @@ static void drawUsageDashboardLandscape() {
   static uint8_t cachedSecondary = 0xFF;
   static uint32_t cachedPrimaryReset = 0xFFFFFFFF;
   static uint32_t cachedSecondaryReset = 0xFFFFFFFF;
+  static bool cachedPrimaryAvailable = false;
+  static bool cachedSecondaryAvailable = false;
   static uint8_t cachedOrient = 0;
   static uint8_t cachedPetState = 0xFF;
   static int cachedPetW = 0;
@@ -1269,7 +1285,9 @@ static void drawUsageDashboardLandscape() {
                    || cachedPrimary != primary
                    || cachedSecondary != secondary
                    || cachedPrimaryReset != primaryReset
-                   || cachedSecondaryReset != secondaryReset;
+                   || cachedSecondaryReset != secondaryReset
+                   || cachedPrimaryAvailable != primaryAvailable
+                   || cachedSecondaryAvailable != secondaryAvailable;
 
   if (panelChanged) {
     M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
@@ -1282,15 +1300,17 @@ static void drawUsageDashboardLandscape() {
     M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 7);
 
     drawUsageMeterOn(&M5.Lcd, rightX, 27, rightW, primary, "5h",
-                     primaryReset, live, p);
+                     primaryReset, live, primaryAvailable, p);
     drawUsageMeterOn(&M5.Lcd, rightX, 81, rightW, secondary, "7d",
-                     secondaryReset, live, p);
+                     secondaryReset, live, secondaryAvailable, p);
 
     cachedLive = live;
     cachedPrimary = primary;
     cachedSecondary = secondary;
     cachedPrimaryReset = primaryReset;
     cachedSecondaryReset = secondaryReset;
+    cachedPrimaryAvailable = primaryAvailable;
+    cachedSecondaryAvailable = secondaryAvailable;
     cachedOrient = clockOrient;
   }
 

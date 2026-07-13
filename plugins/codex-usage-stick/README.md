@@ -186,8 +186,10 @@ tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
 Expected:
 
 ```text
-sent {"state":"busy","tokens":...,"primary":...,"secondary":...}
+sent {"state":"busy","tokens":...,"secondary":...}
 ```
+
+The `primary` pair is absent when OpenAI does not report the 5-hour window.
 
 ## Approve / Deny
 
