@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import select
 import shutil
 import sqlite3
@@ -35,9 +36,9 @@ except ImportError:  # pragma: no cover - user-facing dependency path
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-DEFAULT_CODEX_HOME = Path.home() / ".codex"
+DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
 DEFAULT_CODEX_APP_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
-STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
+STATE_DIR = DEFAULT_CODEX_HOME / "codex-usage-bridge"
 DEFAULT_HOOK_APPROVAL_SOCK = STATE_DIR / "approval.sock"
 SNAPSHOT_CACHE_PATH = STATE_DIR / "last_usage_snapshot.json"
 PRIMARY_RESET_WINDOW_SEC = 5 * 60 * 60
@@ -77,6 +78,34 @@ DIZZY_EVENT_TYPES = {
     "rate_limit",
     "rate_limit_reached",
 }
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    ensure_private_dir(path.parent)
+    path.write_text(text, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
+
+
+def touch_heartbeat(args: argparse.Namespace, status: str) -> None:
+    path = getattr(args, "heartbeat_path", None)
+    if not path:
+        return
+    payload = {
+        "time": time.time(),
+        "status": status,
+        "pid": os.getpid(),
+    }
+    try:
+        write_private_text(path, json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
 
 
 def newer_ts(left: float | None, right: float | None) -> float | None:
@@ -270,10 +299,9 @@ def snapshot_from_cache(path: Path) -> UsageSnapshot | None:
         return None
 
 
-def save_snapshot_cache(snapshot: UsageSnapshot) -> None:
+def save_snapshot_cache(snapshot: UsageSnapshot, path: Path = SNAPSHOT_CACHE_PATH) -> None:
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        SNAPSHOT_CACHE_PATH.write_text(json.dumps(snapshot_to_cache(snapshot), separators=(",", ":")))
+        write_private_text(path, json.dumps(snapshot_to_cache(snapshot), separators=(",", ":")))
     except OSError:
         pass
 
@@ -363,12 +391,15 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
     proc: subprocess.Popen[str] | None = None
     stderr_text = ""
     try:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(args.codex_home)
         proc = subprocess.Popen(
             [str(codex_cli), "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         assert proc.stdin is not None
         assert proc.stdout is not None
@@ -641,7 +672,7 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
     best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
     cached = getattr(read_usage, "_last_valid_snapshot", None)
     if cached is None:
-        cached = snapshot_from_cache(SNAPSHOT_CACHE_PATH)
+        cached = snapshot_from_cache(args.snapshot_cache_path)
     if cached and not snapshot_has_rate_limit(cached, args.limit_id):
         cached = None
 
@@ -650,13 +681,13 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
             best = attach_activity(best, latest_any)
             best = merge_latest_resets(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
-        save_snapshot_cache(best)
+        save_snapshot_cache(best, args.snapshot_cache_path)
         return merge_latest_tokens(best, latest_any)
 
     if cached:
         cached = merge_latest_resets(cached, latest_any)
         setattr(read_usage, "_last_valid_snapshot", cached)
-        save_snapshot_cache(cached)
+        save_snapshot_cache(cached, args.snapshot_cache_path)
         return merge_latest_tokens(cached, latest_any)
 
     if best:
@@ -738,7 +769,10 @@ class BleSession:
         async with self._write_lock:
             for i in range(0, len(payload), self.args.chunk_size):
                 chunk = payload[i:i + self.args.chunk_size]
-                await self.client.write_gatt_char(NUS_RX_UUID, chunk, response=not self.args.no_response)
+                await asyncio.wait_for(
+                    self.client.write_gatt_char(NUS_RX_UUID, chunk, response=not self.args.no_response),
+                    timeout=self.args.ble_write_timeout,
+                )
                 await asyncio.sleep(self.args.chunk_delay)
         return payload.decode("utf-8").strip()
 
@@ -898,6 +932,7 @@ class CodexApprovalProxy:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "CODEX_HOME": str(self.args.codex_home)},
             )
         except FileNotFoundError:
             print("[approval] codex CLI not found; approval proxy disabled", file=sys.stderr)
@@ -1216,8 +1251,10 @@ async def send_usage_update(
 
     if args.dry_run:
         print(line)
+        touch_heartbeat(args, "dry_run")
     elif ble:
         await ble.write_json(packet)
+        touch_heartbeat(args, "sent")
         if args.verbose:
             age = "?"
             if snapshot.event_ts is not None:
@@ -1234,7 +1271,7 @@ async def bridge_loop(args: argparse.Namespace) -> None:
     tracker = ActivityTracker()
     if args.dry_run:
         while True:
-            await send_usage_update(args, tracker)
+            await asyncio.wait_for(send_usage_update(args, tracker), timeout=args.update_timeout)
             if args.once:
                 return
             await asyncio.sleep(args.interval)
@@ -1258,7 +1295,10 @@ async def bridge_loop(args: argparse.Namespace) -> None:
 
         async def usage_runner() -> None:
             while True:
-                await send_usage_update(args, tracker, ble, approvals)
+                await asyncio.wait_for(
+                    send_usage_update(args, tracker, ble, approvals),
+                    timeout=args.update_timeout,
+                )
                 if args.once:
                     return
                 await asyncio.sleep(args.interval)
@@ -1304,6 +1344,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scan-timeout", type=float, default=8.0)
     p.add_argument("--debug-scan", action="store_true", help="Print raw BLE scan results")
     p.add_argument("--connect-timeout", type=float, default=20.0)
+    p.add_argument("--ble-write-timeout", type=float, default=8.0)
+    p.add_argument("--update-timeout", type=float, default=20.0)
+    p.add_argument("--heartbeat-path", type=Path)
     p.add_argument("--no-response", action="store_true", help="Use write-without-response")
     p.add_argument("--pair", action="store_true", help="Try explicit BLE pairing first")
     p.add_argument("--chunk-size", type=int, default=20, help="BLE write chunk size")
@@ -1331,7 +1374,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--hook-approval-sock",
         type=Path,
-        default=DEFAULT_HOOK_APPROVAL_SOCK,
+        default=None,
         help="Unix socket used by PermissionRequest hooks to ask the StickS3",
     )
     p.add_argument(
@@ -1361,14 +1404,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     args.codex_home = args.codex_home.expanduser()
+    args.state_dir = args.codex_home / "codex-usage-bridge"
+    args.snapshot_cache_path = args.state_dir / "last_usage_snapshot.json"
     if args.rollout:
         args.rollout = args.rollout.expanduser()
     if args.approval_sock:
         args.approval_sock = args.approval_sock.expanduser()
     if args.hook_approval_sock:
         args.hook_approval_sock = args.hook_approval_sock.expanduser()
+    else:
+        args.hook_approval_sock = args.state_dir / "approval.sock"
+    if args.heartbeat_path:
+        args.heartbeat_path = args.heartbeat_path.expanduser()
+    else:
+        args.heartbeat_path = args.state_dir / "bridge.heartbeat"
     if args.codex_cli:
         args.codex_cli = args.codex_cli.expanduser()
+    ensure_private_dir(args.state_dir)
 
     if not args.dry_run and (BleakClient is None or BleakScanner is None):
         print("Missing dependency: bleak. Install with `python3 -m pip install bleak`.", file=sys.stderr)

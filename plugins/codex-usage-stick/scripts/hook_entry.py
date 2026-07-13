@@ -22,7 +22,8 @@ from typing import Any
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 START_BRIDGE = PLUGIN_ROOT / "scripts" / "start_bridge.py"
-STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
+DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+STATE_DIR = DEFAULT_CODEX_HOME / "codex-usage-bridge"
 HOOK_LOG_PATH = STATE_DIR / "hook.log"
 APPROVAL_SOCK_PATH = STATE_DIR / "approval.sock"
 APPROVAL_WAIT_SEC = 45.0
@@ -49,10 +50,31 @@ def read_stdin_text() -> str:
 def append_log(record: dict[str, Any]) -> None:
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.chmod(0o700)
         with HOOK_LOG_PATH.open("a", encoding="utf-8") as log:
             log.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        HOOK_LOG_PATH.chmod(0o600)
     except OSError:
         pass
+
+
+def stdin_diagnostics(text: str) -> dict[str, Any]:
+    if not text:
+        return {"stdin_bytes": 0}
+
+    diagnostics: dict[str, Any] = {"stdin_bytes": len(text.encode("utf-8", errors="replace"))}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        diagnostics["stdin_json_error"] = type(exc).__name__
+        return diagnostics
+
+    if isinstance(data, dict):
+        diagnostics["stdin_keys"] = sorted(str(key) for key in data.keys())[:20]
+        for key in ("hook_event_name", "tool_name", "tool"):
+            if data.get(key):
+                diagnostics[key] = str(data.get(key))
+    return diagnostics
 
 
 def env_snapshot() -> dict[str, str | None]:
@@ -152,7 +174,7 @@ def main() -> int:
         "cwd": os.getcwd(),
         "plugin_root": str(PLUGIN_ROOT),
         "env": env_snapshot(),
-        "stdin_preview": stdin_text[:4096],
+        "stdin": stdin_diagnostics(stdin_text),
     })
 
     try:
@@ -163,6 +185,7 @@ def main() -> int:
             text=True,
             timeout=6,
             check=False,
+            env={**os.environ, "CODEX_HOME": str(DEFAULT_CODEX_HOME)},
         )
         append_log({
             "time": now_iso(),
