@@ -173,7 +173,7 @@ For the first BLE pairing on a new computer, start with a foreground `busy`
 test so macOS can show the pairing prompt:
 
 ```bash
-python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0+codex.20260708104734/scripts/codex_usage_ble_bridge.py --verbose --state busy
+python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0+codex.20260713165133/scripts/codex_usage_ble_bridge.py --verbose --state busy
 ```
 
 The StickS3 should show a pairing code. Enter that code on the computer to
@@ -271,13 +271,16 @@ The bridge sends compact JSON over BLE:
 }
 ```
 
+Quota fields are sent as complete value/reset pairs. A pair is omitted when
+OpenAI does not report that window; the firmware renders it as unavailable.
+
 | Field | Meaning |
 | --- | --- |
 | `state` | Pet state: `busy`, `idle`, `completed`, `attention`, `dizzy`, `heart`, or `sleep` |
 | `tokens` | Total token usage value read by the bridge |
-| `primary` | 5-hour usage percentage |
-| `secondary` | 7-day usage percentage |
-| `primary_resets_at` | Unix timestamp for primary reset |
+| `primary` | Optional 5-hour usage percentage |
+| `secondary` | Required 7-day usage percentage |
+| `primary_resets_at` | Optional Unix timestamp for primary reset |
 | `secondary_resets_at` | Unix timestamp for secondary reset |
 | `now` | Sender timestamp |
 

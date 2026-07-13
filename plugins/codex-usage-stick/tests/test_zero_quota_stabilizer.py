@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -12,13 +13,22 @@ sys.modules[SPEC.name] = bridge
 SPEC.loader.exec_module(bridge)
 
 
-def snapshot(primary: int, secondary: int, tokens: int = 1):
+FUTURE_RESET = int(time.time()) + 86400
+
+
+def snapshot(
+    primary: int,
+    secondary: int,
+    tokens: int = 1,
+    primary_reset: int = FUTURE_RESET,
+    secondary_reset: int = FUTURE_RESET,
+):
     return bridge.UsageSnapshot(
         tokens=tokens,
         primary=primary,
         secondary=secondary,
-        primary_resets_at=100,
-        secondary_resets_at=200,
+        primary_resets_at=primary_reset,
+        secondary_resets_at=secondary_reset,
         source=Path("test"),
         event_ts=1.0,
         limit_id="codex",
@@ -65,6 +75,15 @@ class ZeroQuotaStabilizerTest(unittest.TestCase):
         )
         self.assertTrue(was_accepted)
         self.assertEqual(stable.tokens, 2)
+        self.assertEqual(pending, {})
+
+    def test_weekly_only_zero_is_accepted_immediately(self):
+        pending = {"matches": 2}
+        stable, was_accepted = bridge.stabilize_zero_quota(
+            snapshot(0, 0, primary_reset=0), snapshot(8, 2), pending
+        )
+        self.assertTrue(was_accepted)
+        self.assertEqual((stable.primary, stable.secondary), (0, 0))
         self.assertEqual(pending, {})
 
 

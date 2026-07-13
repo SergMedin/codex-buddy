@@ -198,8 +198,10 @@ tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
 A successful BLE send includes:
 
 ```text
-sent {"state":"busy","tokens":...,"primary":...,"secondary":...}
+sent {"state":"busy","tokens":...,"secondary":...}
 ```
+
+The `primary` pair is absent when OpenAI does not report the 5-hour window.
 
 ## 8. Manual Bridge Commands
 

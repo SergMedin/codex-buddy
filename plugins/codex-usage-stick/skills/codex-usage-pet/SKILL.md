@@ -79,7 +79,7 @@ Do not draw large detached sprite components, distant symbols, loose sparkles, g
 1. Prepare the run:
 
 ```bash
-SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0+codex.20260708104734/skills/codex-usage-pet"
+SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0+codex.20260713165133/skills/codex-usage-pet"
 python "$SKILL_DIR/scripts/prepare_pet_run.py" \
   --pet-name "<Name>" \
   --description "<one sentence>" \

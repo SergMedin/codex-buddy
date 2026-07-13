@@ -41,8 +41,8 @@ DEFAULT_CODEX_APP_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
 STATE_DIR = DEFAULT_CODEX_HOME / "codex-usage-bridge"
 DEFAULT_HOOK_APPROVAL_SOCK = STATE_DIR / "approval.sock"
 SNAPSHOT_CACHE_PATH = STATE_DIR / "last_usage_snapshot.json"
-PRIMARY_RESET_WINDOW_SEC = 5 * 60 * 60
-SECONDARY_RESET_WINDOW_SEC = 7 * 24 * 60 * 60
+PRIMARY_WINDOW_MINUTES = 5 * 60
+SECONDARY_WINDOW_MINUTES = 7 * 24 * 60
 APP_SERVER_USAGE_SOURCE = Path("account-rateLimits-read")
 
 INTERESTING_LINE_MARKERS = (
@@ -182,22 +182,22 @@ class UsageSnapshot:
 
     def packet(self, state: str) -> dict[str, Any]:
         now = int(time.time())
-        return {
+        packet = {
             "state": state,
             "tokens": self.tokens,
-            "primary": self.primary,
-            "secondary": self.secondary,
-            "primary_resets_at": roll_reset_at(self.primary_resets_at, PRIMARY_RESET_WINDOW_SEC, now),
-            "secondary_resets_at": roll_reset_at(self.secondary_resets_at, SECONDARY_RESET_WINDOW_SEC, now),
             "now": now,
         }
+        if window_is_available(self.primary_resets_at, now):
+            packet["primary"] = self.primary
+            packet["primary_resets_at"] = self.primary_resets_at
+        if window_is_available(self.secondary_resets_at, now):
+            packet["secondary"] = self.secondary
+            packet["secondary_resets_at"] = self.secondary_resets_at
+        return packet
 
 
-def roll_reset_at(reset_at: int, window_sec: int, now: int) -> int:
-    if reset_at <= 0 or window_sec <= 0 or reset_at > now:
-        return reset_at
-    windows_elapsed = (now - reset_at) // window_sec + 1
-    return reset_at + windows_elapsed * window_sec
+def window_is_available(reset_at: int, now: int | None = None) -> bool:
+    return reset_at > (int(time.time()) if now is None else now)
 
 
 def limit_matches(limit_id: str | None, preferred_limit_id: str) -> bool:
@@ -207,15 +207,13 @@ def limit_matches(limit_id: str | None, preferred_limit_id: str) -> bool:
 
 
 def snapshot_has_rate_limit(snapshot: UsageSnapshot, preferred_limit_id: str) -> bool:
-    return (
-        limit_matches(snapshot.limit_id, preferred_limit_id)
-        and snapshot.primary_resets_at > 0
-        and snapshot.secondary_resets_at > 0
+    return limit_matches(snapshot.limit_id, preferred_limit_id) and window_is_available(
+        snapshot.secondary_resets_at
     )
 
 
 def snapshot_has_reset_times(snapshot: UsageSnapshot) -> bool:
-    return snapshot.primary_resets_at > 0 and snapshot.secondary_resets_at > 0
+    return window_is_available(snapshot.secondary_resets_at)
 
 
 def snapshot_event_key(snapshot: UsageSnapshot) -> float:
@@ -228,8 +226,19 @@ def stabilize_zero_quota(
     pending: dict[str, Any],
     required_matches: int = 3,
 ) -> tuple[UsageSnapshot, bool]:
-    is_zero = snapshot.primary == 0 and snapshot.secondary == 0
-    accepted_is_zero = accepted is not None and accepted.primary == 0 and accepted.secondary == 0
+    is_zero = (
+        snapshot.primary == 0
+        and snapshot.secondary == 0
+        and window_is_available(snapshot.primary_resets_at)
+        and window_is_available(snapshot.secondary_resets_at)
+    )
+    accepted_is_zero = (
+        accepted is not None
+        and accepted.primary == 0
+        and accepted.secondary == 0
+        and window_is_available(accepted.primary_resets_at)
+        and window_is_available(accepted.secondary_resets_at)
+    )
     if not is_zero or accepted is None or accepted_is_zero:
         pending.clear()
         return snapshot, True
@@ -279,15 +288,18 @@ def merge_latest_tokens(snapshot: UsageSnapshot, latest: UsageSnapshot | None) -
     )
 
 
-def merge_latest_resets(snapshot: UsageSnapshot, latest: UsageSnapshot | None) -> UsageSnapshot:
+def merge_latest_rate_limits(snapshot: UsageSnapshot, latest: UsageSnapshot | None) -> UsageSnapshot:
     if (
         not latest
         or not snapshot_has_reset_times(latest)
         or snapshot_event_key(latest) < snapshot_event_key(snapshot)
+        or latest.limit_id != snapshot.limit_id
     ):
         return snapshot
     return replace(
         snapshot,
+        primary=latest.primary,
+        secondary=latest.secondary,
         primary_resets_at=latest.primary_resets_at,
         secondary_resets_at=latest.secondary_resets_at,
     )
@@ -347,6 +359,57 @@ def codex_cli_path(args: argparse.Namespace) -> Path | None:
     return None
 
 
+def _rate_limit_window(window: Any) -> tuple[int | None, int, int]:
+    if not isinstance(window, dict):
+        return None, 0, 0
+
+    raw_minutes = window.get("window_minutes")
+    if raw_minutes is None:
+        raw_minutes = window.get("windowDurationMins")
+    try:
+        minutes = int(raw_minutes) if raw_minutes is not None else None
+    except (TypeError, ValueError):
+        minutes = None
+
+    used_percent = window.get("used_percent")
+    if used_percent is None:
+        used_percent = window.get("usedPercent")
+    resets_at = window.get("resets_at")
+    if resets_at is None:
+        resets_at = window.get("resetsAt")
+    try:
+        reset = int(resets_at or 0)
+    except (TypeError, ValueError):
+        reset = 0
+    return minutes, clamp_percent(used_percent), reset
+
+
+def normalize_rate_limit_windows(rate_limits: dict[str, Any]) -> tuple[int, int, int, int]:
+    windows = [
+        (name, *_rate_limit_window(rate_limits.get(name)))
+        for name in ("primary", "secondary")
+        if isinstance(rate_limits.get(name), dict)
+    ]
+
+    primary_pct = primary_reset = secondary_pct = secondary_reset = 0
+    has_duration = any(minutes is not None for _, minutes, _, _ in windows)
+
+    # 2026-07-12: after the announced 6M-user reset, OpenAI temporarily
+    # omitted the 300-minute window and reported the 10080-minute window as primary.
+    if has_duration:
+        for _, minutes, percent, reset in windows:
+            if minutes == PRIMARY_WINDOW_MINUTES:
+                primary_pct, primary_reset = percent, reset
+            elif minutes == SECONDARY_WINDOW_MINUTES:
+                secondary_pct, secondary_reset = percent, reset
+    elif len(windows) == 2:
+        # Compatibility with older payloads that omitted window durations.
+        _, _, primary_pct, primary_reset = windows[0]
+        _, _, secondary_pct, secondary_reset = windows[1]
+
+    return primary_pct, secondary_pct, primary_reset, secondary_reset
+
+
 def app_server_usage_snapshot_from_result(
     result: dict[str, Any],
     preferred_limit_id: str,
@@ -361,20 +424,14 @@ def app_server_usage_snapshot_from_result(
     if not isinstance(rate_limits, dict):
         return None
 
-    primary = rate_limits.get("primary") or {}
-    secondary = rate_limits.get("secondary") or {}
-    if not isinstance(primary, dict) or not isinstance(secondary, dict):
-        return None
-
-    primary_resets_at = int(primary.get("resetsAt") or 0)
-    secondary_resets_at = int(secondary.get("resetsAt") or 0)
-    if primary_resets_at <= 0 or secondary_resets_at <= 0:
-        return None
+    primary, secondary, primary_resets_at, secondary_resets_at = normalize_rate_limit_windows(
+        rate_limits
+    )
 
     snapshot = UsageSnapshot(
         tokens=activity.tokens if activity else 0,
-        primary=clamp_percent(primary.get("usedPercent")),
-        secondary=clamp_percent(secondary.get("usedPercent")),
+        primary=primary,
+        secondary=secondary,
         primary_resets_at=primary_resets_at,
         secondary_resets_at=secondary_resets_at,
         source=APP_SERVER_USAGE_SOURCE,
@@ -382,6 +439,8 @@ def app_server_usage_snapshot_from_result(
         limit_id=rate_limits.get("limitId") or preferred_limit_id,
         limit_name=rate_limits.get("limitName"),
     )
+    if not snapshot_has_rate_limit(snapshot, preferred_limit_id):
+        return None
     if activity:
         snapshot = attach_activity(snapshot, activity)
     return snapshot
@@ -637,15 +696,16 @@ def extract_token_counts(path: Path, max_bytes: int) -> list[UsageSnapshot]:
         info = payload.get("info") or {}
         total_usage = info.get("total_token_usage") or {}
         rate_limits = payload.get("rate_limits") or {}
-        primary = rate_limits.get("primary") or {}
-        secondary = rate_limits.get("secondary") or {}
+        primary, secondary, primary_resets_at, secondary_resets_at = normalize_rate_limit_windows(
+            rate_limits
+        )
 
         snapshot = UsageSnapshot(
             tokens=int(total_usage.get("total_tokens") or 0),
-            primary=clamp_percent(primary.get("used_percent")),
-            secondary=clamp_percent(secondary.get("used_percent")),
-            primary_resets_at=int(primary.get("resets_at") or 0),
-            secondary_resets_at=int(secondary.get("resets_at") or 0),
+            primary=primary,
+            secondary=secondary,
+            primary_resets_at=primary_resets_at,
+            secondary_resets_at=secondary_resets_at,
             source=path,
             event_ts=event_ts,
             limit_id=rate_limits.get("limit_id"),
@@ -720,21 +780,21 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
     if best and (not cached or snapshot_event_key(best) >= snapshot_event_key(cached)):
         if latest_any:
             best = attach_activity(best, latest_any)
-            best = merge_latest_resets(best, latest_any)
+            best = merge_latest_rate_limits(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
         save_snapshot_cache(best, args.snapshot_cache_path)
         return merge_latest_tokens(best, latest_any)
 
     if cached:
-        cached = merge_latest_resets(cached, latest_any)
+        cached = merge_latest_rate_limits(cached, latest_any)
         setattr(read_usage, "_last_valid_snapshot", cached)
         save_snapshot_cache(cached, args.snapshot_cache_path)
         return merge_latest_tokens(cached, latest_any)
 
     if best:
-        best = merge_latest_resets(best, latest_any)
+        best = merge_latest_rate_limits(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
-        save_snapshot_cache(best)
+        save_snapshot_cache(best, args.snapshot_cache_path)
         return best
 
     if latest_any and snapshot_has_rate_limit(latest_any, args.limit_id):
