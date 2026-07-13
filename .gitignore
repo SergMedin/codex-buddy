@@ -6,3 +6,4 @@ data/*
 data/characters/*
 !data/characters/Mao/
 !data/characters/Mao/**
+tmp/
