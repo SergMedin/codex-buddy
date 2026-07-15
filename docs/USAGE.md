@@ -180,7 +180,7 @@ Submit a prompt in Codex. The `UserPromptSubmit` hook should run.
 Check the hook log:
 
 ```bash
-tail -n 20 ~/.codex/codex-usage-bridge/hook.log
+tail -n 20 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/hook.log"
 ```
 
 A successful automatic trigger includes:
@@ -192,7 +192,7 @@ A successful automatic trigger includes:
 Check the bridge log:
 
 ```bash
-tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
+tail -n 40 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/bridge.log"
 ```
 
 A successful BLE send includes:
@@ -240,14 +240,13 @@ python3 tools/codex_usage_ble_bridge.py --verbose --no-approval-proxy
 The first bridge start creates:
 
 ```text
-${CODEX_HOME:-~/.codex}/codex-usage-bridge/config.json
+${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/config.json
 ```
 
 Default config:
 
 ```json
 {
-  "codex_home": "~/.codex",
   "name": "Codex-",
   "address": null,
   "interval": 5.0,
@@ -263,7 +262,9 @@ Default config:
 
 Use `address` if macOS keeps showing a stale cached BLE name.
 Use `heartbeat_timeout` and the write/update timeouts to recover automatically
-from BLE or app-server calls that hang without exiting.
+from BLE or app-server calls that hang without exiting. The effective heartbeat
+timeout is at least `interval + update_timeout + 5`; set it to `0` to disable
+the watchdog.
 
 ## Troubleshooting
 
@@ -303,7 +304,7 @@ Update to this version. The plugin hooks in this repo do not use `async`.
    ```
 
 4. If the device is not found, increase `scan_timeout` or set `address` in
-   `~/.codex/codex-usage-bridge/config.json`.
+   `${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/config.json`.
 
 ### Bluetooth pairing fails on macOS
 

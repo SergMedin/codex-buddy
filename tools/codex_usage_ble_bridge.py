@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import select
 import shutil
 import sqlite3
@@ -35,9 +36,9 @@ except ImportError:  # pragma: no cover - user-facing dependency path
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-DEFAULT_CODEX_HOME = Path.home() / ".codex"
+DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
 DEFAULT_CODEX_APP_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
-STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
+STATE_DIR = DEFAULT_CODEX_HOME / "codex-usage-bridge"
 DEFAULT_HOOK_APPROVAL_SOCK = STATE_DIR / "approval.sock"
 SNAPSHOT_CACHE_PATH = STATE_DIR / "last_usage_snapshot.json"
 PRIMARY_WINDOW_MINUTES = 5 * 60
@@ -77,6 +78,34 @@ DIZZY_EVENT_TYPES = {
     "rate_limit",
     "rate_limit_reached",
 }
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    ensure_private_dir(path.parent)
+    path.write_text(text, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
+
+
+def touch_heartbeat(args: argparse.Namespace, status: str) -> None:
+    path = getattr(args, "heartbeat_path", None)
+    if not path:
+        return
+    payload = {
+        "time": time.time(),
+        "status": status,
+        "pid": os.getpid(),
+    }
+    try:
+        write_private_text(path, json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
 
 
 def newer_ts(left: float | None, right: float | None) -> float | None:
@@ -191,6 +220,47 @@ def snapshot_event_key(snapshot: UsageSnapshot) -> float:
     return snapshot.event_ts or 0.0
 
 
+def stabilize_zero_quota(
+    snapshot: UsageSnapshot,
+    accepted: UsageSnapshot | None,
+    pending: dict[str, Any],
+    required_matches: int = 3,
+) -> tuple[UsageSnapshot, bool]:
+    is_zero = (
+        snapshot.primary == 0
+        and snapshot.secondary == 0
+        and window_is_available(snapshot.primary_resets_at)
+        and window_is_available(snapshot.secondary_resets_at)
+    )
+    accepted_is_zero = (
+        accepted is not None
+        and accepted.primary == 0
+        and accepted.secondary == 0
+        and window_is_available(accepted.primary_resets_at)
+        and window_is_available(accepted.secondary_resets_at)
+    )
+    if not is_zero or accepted is None or accepted_is_zero:
+        pending.clear()
+        return snapshot, True
+
+    pending["matches"] = int(pending.get("matches", 0)) + 1
+
+    if pending["matches"] >= required_matches:
+        pending.clear()
+        return snapshot, True
+
+    # The upstream usage endpoint occasionally emits an isolated empty 0/0 quota
+    # snapshot. Keep the last accepted quota for the first two consecutive empty
+    # snapshots, while still forwarding current activity and token information.
+    stable = replace(
+        accepted,
+        tokens=snapshot.tokens,
+        event_ts=snapshot.event_ts,
+    )
+    stable = attach_activity(stable, snapshot)
+    return stable, False
+
+
 def attach_activity(snapshot: UsageSnapshot, activity: UsageSnapshot) -> UsageSnapshot:
     return replace(
         snapshot,
@@ -271,10 +341,9 @@ def snapshot_from_cache(path: Path) -> UsageSnapshot | None:
         return None
 
 
-def save_snapshot_cache(snapshot: UsageSnapshot) -> None:
+def save_snapshot_cache(snapshot: UsageSnapshot, path: Path = SNAPSHOT_CACHE_PATH) -> None:
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        SNAPSHOT_CACHE_PATH.write_text(json.dumps(snapshot_to_cache(snapshot), separators=(",", ":")))
+        write_private_text(path, json.dumps(snapshot_to_cache(snapshot), separators=(",", ":")))
     except OSError:
         pass
 
@@ -325,8 +394,9 @@ def normalize_rate_limit_windows(rate_limits: dict[str, Any]) -> tuple[int, int,
     primary_pct = primary_reset = secondary_pct = secondary_reset = 0
     has_duration = any(minutes is not None for _, minutes, _, _ in windows)
 
-    # 2026-07-12: after the announced 6M-user reset, OpenAI temporarily
-    # omitted the 300-minute window and reported the 10080-minute window as primary.
+    # Window slots are not stable, so identify them by duration. This became
+    # necessary on 2026-07-12, when the 6M-user reset temporarily omitted the
+    # 300-minute window and placed the 10080-minute window in the primary slot.
     if has_duration:
         for _, minutes, percent, reset in windows:
             if minutes == PRIMARY_WINDOW_MINUTES:
@@ -411,12 +481,15 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
     proc: subprocess.Popen[str] | None = None
     stderr_text = ""
     try:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(args.codex_home)
         proc = subprocess.Popen(
             [str(codex_cli), "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         assert proc.stdin is not None
         assert proc.stdout is not None
@@ -681,37 +754,48 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
 
     latest_any = max(snapshots, key=snapshot_event_key) if snapshots else None
 
-    app_server_snapshot = read_app_server_usage(args, latest_any)
-    if app_server_snapshot:
-        setattr(read_usage, "_last_valid_snapshot", app_server_snapshot)
-        save_snapshot_cache(app_server_snapshot)
-        return app_server_snapshot
-
-    best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
     cached = getattr(read_usage, "_last_valid_snapshot", None)
     if cached is None:
-        cached = snapshot_from_cache(SNAPSHOT_CACHE_PATH)
+        cached = snapshot_from_cache(args.snapshot_cache_path)
     if cached and not snapshot_has_rate_limit(cached, args.limit_id):
         cached = None
+
+    app_server_snapshot = read_app_server_usage(args, latest_any)
+    if app_server_snapshot:
+        pending = getattr(read_usage, "_pending_zero_quota", None)
+        if pending is None:
+            pending = {}
+            setattr(read_usage, "_pending_zero_quota", pending)
+        stable_snapshot, accepted = stabilize_zero_quota(
+            app_server_snapshot,
+            cached,
+            pending,
+        )
+        if accepted:
+            setattr(read_usage, "_last_valid_snapshot", stable_snapshot)
+            save_snapshot_cache(stable_snapshot, args.snapshot_cache_path)
+        return stable_snapshot
+
+    best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
 
     if best and (not cached or snapshot_event_key(best) >= snapshot_event_key(cached)):
         if latest_any:
             best = attach_activity(best, latest_any)
             best = merge_latest_rate_limits(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
-        save_snapshot_cache(best)
+        save_snapshot_cache(best, args.snapshot_cache_path)
         return merge_latest_tokens(best, latest_any)
 
     if cached:
         cached = merge_latest_rate_limits(cached, latest_any)
         setattr(read_usage, "_last_valid_snapshot", cached)
-        save_snapshot_cache(cached)
+        save_snapshot_cache(cached, args.snapshot_cache_path)
         return merge_latest_tokens(cached, latest_any)
 
     if best:
         best = merge_latest_rate_limits(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
-        save_snapshot_cache(best)
+        save_snapshot_cache(best, args.snapshot_cache_path)
         return best
 
     if latest_any and snapshot_has_rate_limit(latest_any, args.limit_id):
@@ -787,7 +871,10 @@ class BleSession:
         async with self._write_lock:
             for i in range(0, len(payload), self.args.chunk_size):
                 chunk = payload[i:i + self.args.chunk_size]
-                await self.client.write_gatt_char(NUS_RX_UUID, chunk, response=not self.args.no_response)
+                await asyncio.wait_for(
+                    self.client.write_gatt_char(NUS_RX_UUID, chunk, response=not self.args.no_response),
+                    timeout=self.args.ble_write_timeout,
+                )
                 await asyncio.sleep(self.args.chunk_delay)
         return payload.decode("utf-8").strip()
 
@@ -947,6 +1034,7 @@ class CodexApprovalProxy:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "CODEX_HOME": str(self.args.codex_home)},
             )
         except FileNotFoundError:
             print("[approval] codex CLI not found; approval proxy disabled", file=sys.stderr)
@@ -1254,21 +1342,21 @@ async def send_usage_update(
     ble: BleSession | None = None,
     approvals: CodexApprovalProxy | None = None,
 ) -> None:
-    if approvals and approvals.has_pending():
-        return
-
     snapshot = await asyncio.to_thread(read_usage, args)
-    if approvals and approvals.has_pending():
-        return
 
     state = choose_state(args, snapshot, tracker)
+    if approvals and approvals.has_pending():
+        state = "attention"
+
     packet = snapshot.packet(state)
     line = json.dumps(packet, separators=(",", ":"))
 
     if args.dry_run:
         print(line)
+        touch_heartbeat(args, "dry_run")
     elif ble:
         await ble.write_json(packet)
+        touch_heartbeat(args, "sent")
         if args.verbose:
             age = "?"
             if snapshot.event_ts is not None:
@@ -1285,7 +1373,7 @@ async def bridge_loop(args: argparse.Namespace) -> None:
     tracker = ActivityTracker()
     if args.dry_run:
         while True:
-            await send_usage_update(args, tracker)
+            await asyncio.wait_for(send_usage_update(args, tracker), timeout=args.update_timeout)
             if args.once:
                 return
             await asyncio.sleep(args.interval)
@@ -1309,7 +1397,10 @@ async def bridge_loop(args: argparse.Namespace) -> None:
 
         async def usage_runner() -> None:
             while True:
-                await send_usage_update(args, tracker, ble, approvals)
+                await asyncio.wait_for(
+                    send_usage_update(args, tracker, ble, approvals),
+                    timeout=args.update_timeout,
+                )
                 if args.once:
                     return
                 await asyncio.sleep(args.interval)
@@ -1355,6 +1446,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scan-timeout", type=float, default=8.0)
     p.add_argument("--debug-scan", action="store_true", help="Print raw BLE scan results")
     p.add_argument("--connect-timeout", type=float, default=20.0)
+    p.add_argument("--ble-write-timeout", type=float, default=8.0)
+    p.add_argument("--update-timeout", type=float, default=20.0)
+    p.add_argument("--heartbeat-path", type=Path)
     p.add_argument("--no-response", action="store_true", help="Use write-without-response")
     p.add_argument("--pair", action="store_true", help="Try explicit BLE pairing first")
     p.add_argument("--chunk-size", type=int, default=20, help="BLE write chunk size")
@@ -1382,7 +1476,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--hook-approval-sock",
         type=Path,
-        default=DEFAULT_HOOK_APPROVAL_SOCK,
+        default=None,
         help="Unix socket used by PermissionRequest hooks to ask the StickS3",
     )
     p.add_argument(
@@ -1412,14 +1506,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     args.codex_home = args.codex_home.expanduser()
+    args.state_dir = args.codex_home / "codex-usage-bridge"
+    args.snapshot_cache_path = args.state_dir / "last_usage_snapshot.json"
     if args.rollout:
         args.rollout = args.rollout.expanduser()
     if args.approval_sock:
         args.approval_sock = args.approval_sock.expanduser()
     if args.hook_approval_sock:
         args.hook_approval_sock = args.hook_approval_sock.expanduser()
+    else:
+        args.hook_approval_sock = args.state_dir / "approval.sock"
+    if args.heartbeat_path:
+        args.heartbeat_path = args.heartbeat_path.expanduser()
+    else:
+        args.heartbeat_path = args.state_dir / "bridge.heartbeat"
     if args.codex_cli:
         args.codex_cli = args.codex_cli.expanduser()
+    ensure_private_dir(args.state_dir)
 
     if not args.dry_run and (BleakClient is None or BleakScanner is None):
         print("Missing dependency: bleak. Install with `python3 -m pip install bleak`.", file=sys.stderr)

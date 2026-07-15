@@ -173,7 +173,7 @@ For the first BLE pairing on a new computer, start with a foreground `busy`
 test so macOS can show the pairing prompt:
 
 ```bash
-python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0+codex.20260713165133/scripts/codex_usage_ble_bridge.py --verbose --state busy
+python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0/scripts/codex_usage_ble_bridge.py --verbose --state busy
 ```
 
 The StickS3 should show a pairing code. Enter that code on the computer to
@@ -186,7 +186,7 @@ plugin hook should start the BLE bridge automatically.
 Check hook startup:
 
 ```bash
-tail -n 20 ~/.codex/codex-usage-bridge/hook.log
+tail -n 20 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/hook.log"
 ```
 
 You should see `UserPromptSubmit`.
@@ -198,7 +198,7 @@ back to the normal local approval prompt.
 Check BLE packets:
 
 ```bash
-tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
+tail -n 40 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/bridge.log"
 ```
 
 A healthy log contains lines like:
@@ -225,7 +225,7 @@ If it does not connect, restart the StickS3 and check the new computer's bridge
 log:
 
 ```bash
-tail -n 80 ~/.codex/codex-usage-bridge/bridge.log
+tail -n 80 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/bridge.log"
 ```
 
 A StickS3 should be connected to one computer at a time. If the old computer is
@@ -352,8 +352,8 @@ Common checks:
 
 ```bash
 python3 plugins/codex-usage-stick/scripts/start_bridge.py --status
-tail -n 20 ~/.codex/codex-usage-bridge/hook.log
-tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
+tail -n 20 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/hook.log"
+tail -n 40 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/bridge.log"
 ```
 
 If Codex shows a hook warning about async hooks, update to this version. The
