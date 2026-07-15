@@ -1,8 +1,8 @@
 .pio/
 .vscode/
-.DS_Store
 data/*
 !data/characters/
 data/characters/*
 !data/characters/Mao/
 !data/characters/Mao/**
+.DS_Store
