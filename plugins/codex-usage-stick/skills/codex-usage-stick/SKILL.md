@@ -11,9 +11,9 @@ Use this skill when the user asks about the Codex Usage Stick bridge, BLE usage 
 
 - Starts one background BLE bridge for the current user.
 - Sends Codex usage packets to a StickS3 running the matching firmware.
-- Uses `${CODEX_HOME:-~/.codex}/codex-usage-bridge/config.json` for BLE name/address and timing.
-- Writes bridge output to `${CODEX_HOME:-~/.codex}/codex-usage-bridge/bridge.log`.
-- Writes hook diagnostics to `${CODEX_HOME:-~/.codex}/codex-usage-bridge/hook.log`.
+- Uses `${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/config.json` for BLE name/address and timing.
+- Writes bridge output to `${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/bridge.log`.
+- Writes hook diagnostics to `${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/hook.log`.
 - Forwards Codex PermissionRequest prompts to the StickS3 through the local `approval.sock` IPC bridge.
 
 ## Commands
@@ -30,8 +30,8 @@ python3 <plugin-root>/scripts/start_bridge.py --foreground
 For hook diagnostics:
 
 ```sh
-tail -n 40 ~/.codex/codex-usage-bridge/hook.log
-tail -n 80 ~/.codex/codex-usage-bridge/bridge.log
+tail -n 40 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/hook.log"
+tail -n 80 "${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge/bridge.log"
 ```
 
 ## Troubleshooting Order

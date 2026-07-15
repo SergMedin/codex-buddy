@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -27,7 +28,6 @@ LOG_PATH = STATE_DIR / "bridge.log"
 HOOK_LOG_PATH = STATE_DIR / "hook.log"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "codex_home": str(DEFAULT_CODEX_HOME),
     "name": "Codex-",
     "address": None,
     "interval": 5.0,
@@ -39,6 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "verbose": True,
     "no_approval_proxy": True,
 }
+HEARTBEAT_GRACE_SEC = 5.0
 
 SHUTDOWN = False
 
@@ -97,10 +98,12 @@ def running_pid() -> int | None:
 
 
 def bridge_command(cfg: dict[str, Any]) -> list[str]:
-    cmd = [sys.executable, str(BRIDGE_SCRIPT)]
-    codex_home = cfg.get("codex_home")
-    if codex_home:
-        cmd.extend(["--codex-home", str(codex_home)])
+    cmd = [
+        sys.executable,
+        str(BRIDGE_SCRIPT),
+        "--codex-home",
+        str(DEFAULT_CODEX_HOME),
+    ]
     name = cfg.get("name")
     if name:
         cmd.extend(["--name", str(name)])
@@ -123,10 +126,10 @@ def bridge_command(cfg: dict[str, Any]) -> list[str]:
     return cmd
 
 
-def bridge_env(cfg: dict[str, Any]) -> dict[str, str]:
+def bridge_env() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    env["CODEX_HOME"] = str(Path(str(cfg.get("codex_home") or DEFAULT_CODEX_HOME)).expanduser())
+    env["CODEX_HOME"] = str(DEFAULT_CODEX_HOME)
     return env
 
 
@@ -139,6 +142,38 @@ def request_shutdown(_signum: int, _frame: object) -> None:
     SHUTDOWN = True
 
 
+def config_seconds(cfg: dict[str, Any], key: str) -> float:
+    default = float(DEFAULT_CONFIG[key])
+    try:
+        value = float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, value)
+
+
+def effective_heartbeat_timeout(cfg: dict[str, Any]) -> float:
+    configured = config_seconds(cfg, "heartbeat_timeout")
+    if configured <= 0:
+        return 0.0
+    minimum = (
+        config_seconds(cfg, "interval")
+        + config_seconds(cfg, "update_timeout")
+        + HEARTBEAT_GRACE_SEC
+    )
+    return max(configured, minimum)
+
+
+def terminate_process(proc: subprocess.Popen[Any], timeout: float = 3.0) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def supervise_bridge() -> int:
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
@@ -147,17 +182,13 @@ def supervise_bridge() -> int:
         cfg = load_config()
         with contextlib.suppress(FileNotFoundError):
             HEARTBEAT_PATH.unlink()
-        proc = subprocess.Popen(bridge_command(cfg), cwd=str(PLUGIN_ROOT), env=bridge_env(cfg))
+        proc = subprocess.Popen(bridge_command(cfg), cwd=str(PLUGIN_ROOT), env=bridge_env())
         write_private_text(CHILD_PID_PATH, f"{proc.pid}\n")
         started_at = time.time()
-        heartbeat_timeout = float(cfg.get("heartbeat_timeout", 90.0) or 90.0)
+        heartbeat_timeout = effective_heartbeat_timeout(cfg)
         while proc.poll() is None:
             if SHUTDOWN:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                terminate_process(proc)
                 break
             if heartbeat_timeout > 0:
                 try:
@@ -171,11 +202,7 @@ def supervise_bridge() -> int:
                         f"[supervisor] bridge heartbeat stale for {heartbeat_age:.0f}s; restarting pid {proc.pid}",
                         flush=True,
                     )
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                    terminate_process(proc)
                     break
             time.sleep(1)
         with contextlib.suppress(FileNotFoundError):
@@ -192,7 +219,7 @@ def start_bridge(foreground: bool = False) -> int:
         return 2
 
     if foreground:
-        return subprocess.call(bridge_command(cfg), cwd=str(PLUGIN_ROOT), env=bridge_env(cfg))
+        return subprocess.call(bridge_command(cfg), cwd=str(PLUGIN_ROOT), env=bridge_env())
 
     pid = running_pid()
     if pid is not None:
@@ -208,7 +235,7 @@ def start_bridge(foreground: bool = False) -> int:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-            env=bridge_env(cfg),
+            env=bridge_env(),
         )
     write_private_text(PID_PATH, f"{proc.pid}\n")
     return 0
