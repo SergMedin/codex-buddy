@@ -366,8 +366,9 @@ def normalize_rate_limit_windows(rate_limits: dict[str, Any]) -> tuple[int, int,
     primary_pct = primary_reset = secondary_pct = secondary_reset = 0
     has_duration = any(minutes is not None for _, minutes, _, _ in windows)
 
-    # 2026-07-12: after the announced 6M-user reset, OpenAI temporarily
-    # omitted the 300-minute window and reported the 10080-minute window as primary.
+    # Window slots are not stable, so identify them by duration. This became
+    # necessary on 2026-07-12, when the 6M-user reset temporarily omitted the
+    # 300-minute window and placed the 10080-minute window in the primary slot.
     if has_duration:
         for _, minutes, percent, reset in windows:
             if minutes == PRIMARY_WINDOW_MINUTES:
@@ -741,7 +742,7 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
         )
         if accepted:
             setattr(read_usage, "_last_valid_snapshot", stable_snapshot)
-            save_snapshot_cache(stable_snapshot, args.snapshot_cache_path)
+            save_snapshot_cache(stable_snapshot)
         return stable_snapshot
 
     best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
@@ -763,7 +764,7 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
     if best:
         best = merge_latest_rate_limits(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
-        save_snapshot_cache(best, args.snapshot_cache_path)
+        save_snapshot_cache(best)
         return best
 
     if latest_any and snapshot_has_rate_limit(latest_any, args.limit_id):

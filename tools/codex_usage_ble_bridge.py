@@ -191,6 +191,47 @@ def snapshot_event_key(snapshot: UsageSnapshot) -> float:
     return snapshot.event_ts or 0.0
 
 
+def stabilize_zero_quota(
+    snapshot: UsageSnapshot,
+    accepted: UsageSnapshot | None,
+    pending: dict[str, Any],
+    required_matches: int = 3,
+) -> tuple[UsageSnapshot, bool]:
+    is_zero = (
+        snapshot.primary == 0
+        and snapshot.secondary == 0
+        and window_is_available(snapshot.primary_resets_at)
+        and window_is_available(snapshot.secondary_resets_at)
+    )
+    accepted_is_zero = (
+        accepted is not None
+        and accepted.primary == 0
+        and accepted.secondary == 0
+        and window_is_available(accepted.primary_resets_at)
+        and window_is_available(accepted.secondary_resets_at)
+    )
+    if not is_zero or accepted is None or accepted_is_zero:
+        pending.clear()
+        return snapshot, True
+
+    pending["matches"] = int(pending.get("matches", 0)) + 1
+
+    if pending["matches"] >= required_matches:
+        pending.clear()
+        return snapshot, True
+
+    # The upstream usage endpoint occasionally emits an isolated empty 0/0 quota
+    # snapshot. Keep the last accepted quota for the first two consecutive empty
+    # snapshots, while still forwarding current activity and token information.
+    stable = replace(
+        accepted,
+        tokens=snapshot.tokens,
+        event_ts=snapshot.event_ts,
+    )
+    stable = attach_activity(stable, snapshot)
+    return stable, False
+
+
 def attach_activity(snapshot: UsageSnapshot, activity: UsageSnapshot) -> UsageSnapshot:
     return replace(
         snapshot,
@@ -325,8 +366,9 @@ def normalize_rate_limit_windows(rate_limits: dict[str, Any]) -> tuple[int, int,
     primary_pct = primary_reset = secondary_pct = secondary_reset = 0
     has_duration = any(minutes is not None for _, minutes, _, _ in windows)
 
-    # 2026-07-12: after the announced 6M-user reset, OpenAI temporarily
-    # omitted the 300-minute window and reported the 10080-minute window as primary.
+    # Window slots are not stable, so identify them by duration. This became
+    # necessary on 2026-07-12, when the 6M-user reset temporarily omitted the
+    # 300-minute window and placed the 10080-minute window in the primary slot.
     if has_duration:
         for _, minutes, percent, reset in windows:
             if minutes == PRIMARY_WINDOW_MINUTES:
@@ -681,18 +723,29 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
 
     latest_any = max(snapshots, key=snapshot_event_key) if snapshots else None
 
-    app_server_snapshot = read_app_server_usage(args, latest_any)
-    if app_server_snapshot:
-        setattr(read_usage, "_last_valid_snapshot", app_server_snapshot)
-        save_snapshot_cache(app_server_snapshot)
-        return app_server_snapshot
-
-    best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
     cached = getattr(read_usage, "_last_valid_snapshot", None)
     if cached is None:
         cached = snapshot_from_cache(SNAPSHOT_CACHE_PATH)
     if cached and not snapshot_has_rate_limit(cached, args.limit_id):
         cached = None
+
+    app_server_snapshot = read_app_server_usage(args, latest_any)
+    if app_server_snapshot:
+        pending = getattr(read_usage, "_pending_zero_quota", None)
+        if pending is None:
+            pending = {}
+            setattr(read_usage, "_pending_zero_quota", pending)
+        stable_snapshot, accepted = stabilize_zero_quota(
+            app_server_snapshot,
+            cached,
+            pending,
+        )
+        if accepted:
+            setattr(read_usage, "_last_valid_snapshot", stable_snapshot)
+            save_snapshot_cache(stable_snapshot)
+        return stable_snapshot
+
+    best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
 
     if best and (not cached or snapshot_event_key(best) >= snapshot_event_key(cached)):
         if latest_any:
