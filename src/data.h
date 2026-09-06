@@ -17,6 +17,9 @@ struct TamaState {
   bool     codexSecondaryAvailable;
   uint32_t codexPrimaryResetsAt;
   uint32_t codexSecondaryResetsAt;
+  int16_t  codexForecast48h = -1; // -1 unavailable; 101 means beyond 100%
+  int16_t  codexForecast14d = -1;
+  uint32_t codexForecastValidUntil = 0;
   char     codexState[16];
   uint32_t lastUpdated;
   char     msg[24];
@@ -99,6 +102,19 @@ static uint8_t _jsonPct(JsonVariant v, uint8_t fallback) {
   return (uint8_t)n;
 }
 
+static int16_t _jsonForecast(JsonVariant v) {
+  if (!v.is<int>()) return -1;
+  int n = v.as<int>();
+  return n >= 0 && n <= 101 ? (int16_t)n : -1;
+}
+
+inline bool dataForecastActive(const TamaState& state) {
+  uint32_t now = 0;
+  return !dataDemo() && state.connected && state.codexSecondaryAvailable
+      && dataUtcNow(&now) && now < state.codexSecondaryResetsAt
+      && now < state.codexForecastValidUntil;
+}
+
 static void _applyPrompt(JsonVariant v, TamaState* out, bool clearIfNull) {
   JsonObject pr = v.as<JsonObject>();
   if (!pr.isNull()) {
@@ -165,6 +181,10 @@ static void _applyJson(const char* line, TamaState* out) {
       out->codexSecondary = _jsonPct(doc["secondary"], out->codexSecondary);
       out->codexSecondaryResetsAt = doc["secondary_resets_at"].as<uint32_t>();
     }
+    out->codexForecast48h = hasSecondary ? _jsonForecast(doc["secondary_forecast_48h"]) : -1;
+    out->codexForecast14d = hasSecondary ? _jsonForecast(doc["secondary_forecast_14d"]) : -1;
+    out->codexForecastValidUntil = hasSecondary && doc["secondary_forecast_valid_until"].is<uint32_t>()
+                                ? doc["secondary_forecast_valid_until"].as<uint32_t>() : 0;
 
     out->sessionsRunning = strcmp(out->codexState, "busy") == 0 ? 1 : 0;
     out->sessionsWaiting = strcmp(out->codexState, "attention") == 0 ? 1 : 0;

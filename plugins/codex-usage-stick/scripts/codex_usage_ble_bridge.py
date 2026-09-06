@@ -13,13 +13,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
+import math
 import os
 import select
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -179,6 +182,10 @@ class UsageSnapshot:
     attention_at: float | None = None
     dizzy_at: float | None = None
     last_activity_at: float | None = None
+    # Fresh quota observation time, separate from task activity. Never cached.
+    quota_observed_at: float | None = None
+    quota_log_valid: bool = False
+    quota_account: str | None = None
 
     def packet(self, state: str) -> dict[str, Any]:
         now = int(time.time())
@@ -194,6 +201,182 @@ class UsageSnapshot:
             packet["secondary"] = self.secondary
             packet["secondary_resets_at"] = self.secondary_resets_at
         return packet
+
+
+class QuotaForecast:
+    """Optional, bounded history of observed weekly quota (not task tokens)."""
+
+    HORIZONS = {"secondary_forecast_48h": 2 * 86400, "secondary_forecast_14d": 14 * 86400}
+    SAMPLE_SECONDS = 300
+    MIN_HISTORY_SECONDS = 3600
+    TTL_SECONDS = 900
+    MAX_INTERPOLATION_GAP = 6 * 3600
+    MAX_POINTS = 4100
+    RESET_TOLERANCE_SECONDS = 5  # API/log reset timestamps can differ by rounding.
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.key: list[Any] | None = None
+        self.points: list[list[float | int]] = []
+        try:
+            if path.stat().st_size > 1024 * 1024:
+                return
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict) or data.get("version") != 1:
+                return
+            points = data.get("points")
+            if not isinstance(points, list) or len(points) > self.MAX_POINTS:
+                return
+            previous = 0.0
+            previous_point = None
+            for point in points:
+                if not isinstance(point, list) or len(point) != 3:
+                    return
+                t, p, r = point
+                if not all(type(v) in (int, float) and math.isfinite(v) for v in point):
+                    return
+                if not previous < t < r <= t + 7 * 86400 or not 0 <= p <= 100:
+                    return
+                if previous_point is not None:
+                    if r == previous_point[2] and p < previous_point[1]:
+                        return
+                previous = t
+                previous_point = point
+            self.key = data.get("key")
+            self.points = points
+        except (OSError, ValueError, TypeError, OverflowError):
+            pass
+
+    def seed(self, current: UsageSnapshot, logs: list[UsageSnapshot],
+             key: list[Any], earliest: float = 0) -> None:
+        """One-time bootstrap from already-read logs of this live-confirmed cycle."""
+        if self.points and self.key == key:
+            return
+        t, r = current.quota_observed_at, current.secondary_resets_at
+        if t is None:
+            return
+        candidates = [s for s in logs if s.quota_log_valid and s.limit_id == current.limit_id
+                      and s.event_ts is not None and max(earliest, r - 7 * 86400) <= s.event_ts < t
+                      and abs(s.secondary_resets_at - r) <= self.RESET_TOLERANCE_SECONDS]
+        if not candidates or any(s.secondary > current.secondary for s in candidates):
+            return
+        points = []
+        for s in sorted(candidates, key=lambda s: (s.event_ts, -s.secondary)):
+            if points and (s.event_ts - points[-1][0] < self.SAMPLE_SECONDS or s.secondary < points[-1][1]):
+                continue
+            points.append([s.event_ts, s.secondary, r])
+        self.key, self.points = key, points[-self.MAX_POINTS:]
+        self.save()
+
+    def save(self) -> None:
+        ensure_private_dir(self.path.parent)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as f:
+                temp_path = Path(f.name)
+                json.dump({"version": 1, "key": self.key, "points": self.points}, f,
+                          separators=(",", ":"), allow_nan=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path is not None:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink(missing_ok=True)
+
+    def packet_fields(self, snapshot: UsageSnapshot, now: float, key: list[Any]) -> dict[str, int]:
+        t = snapshot.quota_observed_at
+        p, r = snapshot.secondary, snapshot.secondary_resets_at
+        if t is None or not all(math.isfinite(v) for v in (t, p, r, now)):
+            return {}
+        if not 0 <= now - t < self.TTL_SECONDS or not 0 <= p <= 100 or not now < r <= t + 7 * 86400:
+            return {}
+        if key != self.key:
+            self.key, self.points = key, []
+        if self.points:
+            last_t, last_p, last_r = self.points[-1]
+            if abs(r - last_r) <= self.RESET_TOLERANCE_SECONDS:
+                r = last_r
+                if r <= now:
+                    return {}
+            # Late measurements never erase history. Reset boundaries only break
+            # the interval between samples, including early/manual resets.
+            if t < last_t or (t == last_t and (p != last_p or r != last_r)):
+                return {}
+            if r == last_r and p < last_p:
+                # Keep the high-water mark: 40 -> 0 -> 40 must not count twice.
+                return {}
+
+        point = [t, p, r]
+        changed = not self.points or r != self.points[-1][2] or t - self.points[-1][0] >= self.SAMPLE_SECONDS
+        if changed:
+            self.points.append(point)
+            cutoff = t - max(self.HORIZONS.values())
+            while len(self.points) > 1 and self.points[1][0] <= cutoff:
+                self.points.pop(0)
+            self.points = self.points[-self.MAX_POINTS:]
+            self.save()
+        points = self.points if self.points[-1][0] == t else self.points + [point]
+        fields = {}
+        for name, horizon in self.HORIZONS.items():
+            start = max(points[0][0], t - horizon)
+            span = t - start
+            if span < self.MIN_HISTORY_SECONDS:
+                continue
+            consumed = covered = 0.0
+            for a, b in zip(points, points[1:]):
+                duration = b[0] - a[0]
+                overlap = b[0] - max(start, a[0])
+                if overlap <= 0 or duration <= 0 or a[2] != b[2] or b[1] < a[1]:
+                    continue
+                # A whole same-cycle gap has a known total delta, including sleep.
+                # Do not distribute a long unobserved gap across a window boundary.
+                if overlap < duration and duration > self.MAX_INTERPOLATION_GAP:
+                    continue
+                covered += overlap
+                consumed += (b[1] - a[1]) * overlap / duration
+            if covered < self.MIN_HISTORY_SECONDS or covered < span * 0.8:
+                continue
+            forecast = p + consumed / covered * (r - now)
+            # 101 is an overflow indicator, not a literal prediction of 101%.
+            fields[name] = 101 if forecast > 100 else max(p, round(forecast))
+        if fields:
+            fields["secondary_forecast_valid_until"] = min(r, int(t + self.TTL_SECONDS))
+        return fields
+
+
+def forecast_packet_fields(args: argparse.Namespace, snapshot: UsageSnapshot) -> dict[str, int]:
+    if snapshot.quota_observed_at is None or snapshot.quota_account is None:
+        return {}
+    try:
+        history = getattr(args, "_quota_forecast", None)
+        if history is None:
+            history = QuotaForecast(args.snapshot_cache_path.parent / "quota_history.json")
+            args._quota_forecast = history
+        key = [snapshot.limit_id, snapshot.quota_account]
+        # Migrate the old file-metadata key only while it still matches the
+        # current auth file. This check is never used as the new identity.
+        earliest = 0
+        if history.key != key:
+            try:
+                auth = (args.codex_home / "auth.json").stat()
+                earliest = auth.st_mtime
+                legacy_key = [snapshot.limit_id, [auth.st_ino, auth.st_mtime_ns, auth.st_size]]
+                if history.key == legacy_key:
+                    history.key = key
+                    history.save()
+            except FileNotFoundError:
+                pass
+        if not getattr(args, "_quota_seed_attempted", False):
+            history.seed(snapshot, getattr(args, "_quota_log_samples", []), key, earliest)
+            args._quota_seed_attempted = True
+            args._quota_log_samples = []
+        return history.packet_fields(snapshot, time.time(), key)
+    except Exception as exc:
+        # Optional analytics must never interrupt quota/state/approval delivery.
+        if args.verbose:
+            print(f"[forecast] unavailable: {type(exc).__name__}", file=sys.stderr)
+        return {}
 
 
 def window_is_available(reset_at: int, now: int | None = None) -> bool:
@@ -411,6 +594,14 @@ def normalize_rate_limit_windows(rate_limits: dict[str, Any]) -> tuple[int, int,
     return primary_pct, secondary_pct, primary_reset, secondary_reset
 
 
+def rate_limit_percentages_valid(rate_limits: dict[str, Any]) -> bool:
+    reported = [rate_limits[name] for name in ("primary", "secondary")
+                if isinstance(rate_limits.get(name), dict)]
+    percentages = [w.get("used_percent", w.get("usedPercent")) for w in reported]
+    return bool(percentages) and all(type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 100
+                                     for v in percentages)
+
+
 def app_server_usage_snapshot_from_result(
     result: dict[str, Any],
     preferred_limit_id: str,
@@ -440,11 +631,28 @@ def app_server_usage_snapshot_from_result(
         limit_id=rate_limits.get("limitId") or preferred_limit_id,
         limit_name=rate_limits.get("limitName"),
     )
+    # Only a successful, well-formed live response can extend forecast history.
+    # Preserve the existing display normalization for older/fallback packets.
+    if rate_limit_percentages_valid(rate_limits):
+        snapshot.quota_observed_at = time.time()
     if not snapshot_has_rate_limit(snapshot, preferred_limit_id):
         return None
     if activity:
         snapshot = attach_activity(snapshot, activity)
     return snapshot
+
+
+def forecast_account_identity(result: dict[str, Any] | None) -> str | None:
+    account = result.get("account") if isinstance(result, dict) else None
+    if not isinstance(account, dict) or account.get("type") != "chatgpt":
+        return None
+    email, plan = account.get("email"), account.get("planType")
+    if not isinstance(email, str) or not email.strip() or not isinstance(plan, str) or plan == "unknown":
+        return None
+    # account/read exposes email + plan, not an opaque account/workspace ID.
+    # Persist only their fingerprint, never the email or authentication tokens.
+    identity = json.dumps([email.strip().lower(), plan], separators=(",", ":"))
+    return "account-v1:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | None) -> UsageSnapshot | None:
@@ -478,8 +686,12 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
         "method": "account/rateLimits/read",
     }
 
+    account_msg = {"id": "codex-usage-account", "method": "account/read",
+                   "params": {"refreshToken": False}}
     proc: subprocess.Popen[str] | None = None
     stderr_text = ""
+    quota_result = account_result = None
+    account_received = quota_received = False
     try:
         env = os.environ.copy()
         env["CODEX_HOME"] = str(args.codex_home)
@@ -494,37 +706,39 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
         assert proc.stdin is not None
         assert proc.stdout is not None
 
-        for msg in (init_msg, read_msg):
+        for msg in (init_msg, account_msg, read_msg):
             proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
         proc.stdin.flush()
 
         deadline = time.monotonic() + args.appserver_timeout
-        while time.monotonic() < deadline:
+        buffer = b""
+        while time.monotonic() < deadline and not (account_received and quota_received):
             ready, _, _ = select.select([proc.stdout], [], [], 0.1)
             if not ready:
                 if proc.poll() is not None:
                     break
                 continue
-
-            line = proc.stdout.readline()
-            if not line:
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
                 break
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if msg.get("id") != read_msg["id"]:
-                continue
-            if isinstance(msg.get("result"), dict):
-                return app_server_usage_snapshot_from_result(
-                    msg["result"],
-                    args.limit_id,
-                    activity,
-                )
-            if args.verbose and msg.get("error"):
-                print(f"[usage] app-server rateLimits/read error: {msg['error']}", file=sys.stderr)
-            return None
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("id") == account_msg["id"]:
+                    account_received, account_result = True, msg.get("result")
+                elif msg.get("id") == read_msg["id"]:
+                    quota_received, quota_result = True, msg.get("result")
+        if isinstance(quota_result, dict):
+            snapshot = app_server_usage_snapshot_from_result(quota_result, args.limit_id, activity)
+            if snapshot is not None:
+                snapshot.quota_account = forecast_account_identity(account_result)
+            return snapshot
     except Exception as exc:
         if args.verbose:
             print(f"[usage] app-server usage unavailable: {exc}", file=sys.stderr)
@@ -541,6 +755,7 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
             if proc.poll() is None:
                 with contextlib.suppress(Exception):
                     proc.kill()
+                    proc.wait(timeout=0.5)
             with contextlib.suppress(Exception):
                 if proc.stderr:
                     stderr_text = proc.stderr.read()
@@ -553,6 +768,10 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
                 if noisy:
                     print("[usage] app-server stderr: " + " | ".join(noisy[-3:]), file=sys.stderr)
 
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
     if args.verbose:
         print("[usage] app-server rateLimits/read timed out; falling back to rollout logs", file=sys.stderr)
     return None
@@ -561,7 +780,7 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
 def clamp_percent(value: Any) -> int:
     try:
         n = round(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         n = 0
     return max(0, min(100, n))
 
@@ -711,6 +930,7 @@ def extract_token_counts(path: Path, max_bytes: int) -> list[UsageSnapshot]:
             event_ts=event_ts,
             limit_id=rate_limits.get("limit_id"),
             limit_name=rate_limits.get("limit_name"),
+            quota_log_valid=rate_limit_percentages_valid(rate_limits),
         )
         snapshots.append(snapshot)
 
@@ -753,12 +973,16 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
         snapshots.extend(extract_token_counts(path, args.tail_bytes))
 
     latest_any = max(snapshots, key=snapshot_event_key) if snapshots else None
+    if not getattr(args, "_quota_seed_attempted", False):
+        args._quota_log_samples = snapshots
 
     cached = getattr(read_usage, "_last_valid_snapshot", None)
     if cached is None:
         cached = snapshot_from_cache(args.snapshot_cache_path)
     if cached and not snapshot_has_rate_limit(cached, args.limit_id):
         cached = None
+    if cached:
+        cached = replace(cached, quota_observed_at=None, quota_account=None)
 
     app_server_snapshot = read_app_server_usage(args, latest_any)
     if app_server_snapshot:
@@ -774,7 +998,7 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
         if accepted:
             setattr(read_usage, "_last_valid_snapshot", stable_snapshot)
             save_snapshot_cache(stable_snapshot, args.snapshot_cache_path)
-        return stable_snapshot
+        return stable_snapshot if accepted else replace(stable_snapshot, quota_observed_at=None)
 
     best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
 
@@ -1349,6 +1573,7 @@ async def send_usage_update(
         state = "attention"
 
     packet = snapshot.packet(state)
+    packet.update(forecast_packet_fields(args, snapshot))
     line = json.dumps(packet, separators=(",", ":"))
 
     if args.dry_run:

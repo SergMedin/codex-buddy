@@ -1137,10 +1137,28 @@ static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
   }
 }
 
+// All marker pixels stay inside the existing 13px bar, including overflow.
+static void drawForecastTick(lgfx::v1::LGFXBase* dst, int bx, int by, int bw,
+                             int forecast, bool upper) {
+  if (forecast < 0 || forecast > 101 || bw < 8) return;
+  int position = forecast > 100 ? 100 : forecast;
+  int mx = bx + 1 + (bw - 4) * position / 100;
+  int my = by + (upper ? 1 : 7);
+  uint16_t color = upper ? 0x07FF : 0xF81F; // cyan: 48h; magenta: 14d
+  if (mx > bx + 1) dst->fillRect(mx - 1, my, 1, 5, 0x0000);
+  if (mx + 2 < bx + bw - 1) dst->fillRect(mx + 2, my, 1, 5, 0x0000);
+  dst->fillRect(mx, my, 2, 5, color);
+  if (forecast > 100) {
+    // Right-pointing chevron at the ceiling, distinct from exactly 100%.
+    dst->drawLine(mx - 2, my, mx + 1, my + 2, color);
+    dst->drawLine(mx - 2, my + 4, mx + 1, my + 2, color);
+  }
+}
+
 static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
                              uint8_t pct, const char* windowLabel,
                              uint32_t resetAt, bool live, bool available,
-                             const Palette& p) {
+                             const Palette& p, int forecast48h = -1, int forecast14d = -1) {
   if (pct > 100) pct = 100;
   bool active = live && available;
   uint16_t fill = active ? usageColor(pct, p) : p.textDim;
@@ -1160,6 +1178,10 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
   dst->fillRect(bx + 1, by + 1, bw - 2, bh - 2, p.bg);
   int fw = (int)((uint32_t)(bw - 2) * pct / 100);
   if (active && fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
+  if (active) {
+    drawForecastTick(dst, bx, by, bw, forecast48h, true);
+    drawForecastTick(dst, bx, by, bw, forecast14d, false);
+  }
 
   dst->setTextSize(1);
   dst->setTextDatum(TL_DATUM);
@@ -1189,9 +1211,9 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
 
 static void drawUsageMeter(int y, uint8_t pct, const char* windowLabel,
                            uint32_t resetAt, bool live, bool available,
-                           const Palette& p) {
+                           const Palette& p, int forecast48h = -1, int forecast14d = -1) {
   drawUsageMeterOn(&spr, 8, y, W - 16, pct, windowLabel, resetAt,
-                   live, available, p);
+                   live, available, p, forecast48h, forecast14d);
 }
 
 static void drawUsageDashboard() {
@@ -1234,7 +1256,9 @@ static void drawUsageDashboard() {
   drawUsageMeter(122, primary, "5h", live ? tama.codexPrimaryResetsAt : 0,
                  live, tama.codexPrimaryAvailable, p);
   drawUsageMeter(184, secondary, "7d", live ? tama.codexSecondaryResetsAt : 0,
-                 live, tama.codexSecondaryAvailable, p);
+                 live, tama.codexSecondaryAvailable, p,
+                 dataForecastActive(tama) ? tama.codexForecast48h : -1,
+                 dataForecastActive(tama) ? tama.codexForecast14d : -1);
 
   spr.setTextDatum(TL_DATUM);
 }
@@ -1248,6 +1272,8 @@ static void drawUsageDashboardLandscape() {
   uint32_t secondaryReset = live ? tama.codexSecondaryResetsAt : 0;
   bool primaryAvailable = tama.codexPrimaryAvailable;
   bool secondaryAvailable = tama.codexSecondaryAvailable;
+  int forecast48h = dataForecastActive(tama) ? tama.codexForecast48h : -1;
+  int forecast14d = dataForecastActive(tama) ? tama.codexForecast14d : -1;
 
   if (!usageLiveKnown || usageLastLive != live) {
     usageLiveKnown = true;
@@ -1275,6 +1301,8 @@ static void drawUsageDashboardLandscape() {
   static uint32_t cachedSecondaryReset = 0xFFFFFFFF;
   static bool cachedPrimaryAvailable = false;
   static bool cachedSecondaryAvailable = false;
+  static int cachedForecast48h = -1;
+  static int cachedForecast14d = -1;
   static uint8_t cachedOrient = 0;
   static uint8_t cachedPetState = 0xFF;
   static int cachedPetW = 0;
@@ -1287,7 +1315,9 @@ static void drawUsageDashboardLandscape() {
                    || cachedPrimaryReset != primaryReset
                    || cachedSecondaryReset != secondaryReset
                    || cachedPrimaryAvailable != primaryAvailable
-                   || cachedSecondaryAvailable != secondaryAvailable;
+                   || cachedSecondaryAvailable != secondaryAvailable
+                   || cachedForecast48h != forecast48h
+                   || cachedForecast14d != forecast14d;
 
   if (panelChanged) {
     M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
@@ -1302,7 +1332,7 @@ static void drawUsageDashboardLandscape() {
     drawUsageMeterOn(&M5.Lcd, rightX, 27, rightW, primary, "5h",
                      primaryReset, live, primaryAvailable, p);
     drawUsageMeterOn(&M5.Lcd, rightX, 81, rightW, secondary, "7d",
-                     secondaryReset, live, secondaryAvailable, p);
+                     secondaryReset, live, secondaryAvailable, p, forecast48h, forecast14d);
 
     cachedLive = live;
     cachedPrimary = primary;
@@ -1311,6 +1341,8 @@ static void drawUsageDashboardLandscape() {
     cachedSecondaryReset = secondaryReset;
     cachedPrimaryAvailable = primaryAvailable;
     cachedSecondaryAvailable = secondaryAvailable;
+    cachedForecast48h = forecast48h;
+    cachedForecast14d = forecast14d;
     cachedOrient = clockOrient;
   }
 

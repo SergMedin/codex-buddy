@@ -32,9 +32,49 @@ usage bridge.
 - Color-coded reset time values:
   - `5h`: green above 3h, orange above 1h, red at 1h or below
   - `7d`: green above 4d, orange above 2d, red at 2d or below
+- Two optional forecast ticks inside the existing `7d` bar:
+  - cyan, upper half: recent pace, using up to 48 hours of history
+  - magenta, lower half: longer-term pace, using up to 14 days of history
 
 Portrait mode places the pet above the usage bars. Landscape mode places the
 pet on the left and usage bars on the right.
+
+Both ticks project usage at the next weekly reset: current usage plus the
+observed average consumption rate multiplied by time remaining. They use the
+available history after at least one hour of observations; there is no 14-day
+waiting period. With less than 48 hours of history, the ticks can coincide.
+Their separate vertical positions keep both visible. A small right-pointing
+chevron inside the bar means projected usage exceeds 100%.
+
+The bridge keeps a bounded, atomically written `quota_history.json` in
+`${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge`, sampling fresh quota responses
+at five-minute intervals. On startup, it can seed missing history from the
+rollout records it already reads, but only for the current, live-confirmed
+weekly cycle and matching limit. Older cycles are not imported. Duplicate
+records, percentage decreases, and reset timestamp rounding are handled before
+calculating rates. Both scheduled and manual quota resets preserve the rolling
+history: only the interval straddling a reset is excluded from consumption and
+observed time. Forecasts immediately use the retained rate with the new quota
+and reset deadline; they do not restart the one-hour warmup.
+
+History is scoped to the quota limit and a fingerprint of the account email
+and plan returned by `account/read`; routine credential refreshes preserve it.
+Only the fingerprint is stored, not email or credentials. Account/plan changes
+start a separate history, and unavailable identity temporarily hides forecasts.
+The API does not expose a workspace identifier, so workspaces with the same
+email and plan cannot be distinguished. Initial log bootstrap excludes records
+older than the authentication file's modification time. Existing file-metadata
+history keys are migrated only when they still match that file.
+
+Forecasts are approximate: quota percentages are rounded, unobserved reset
+boundaries have unknown consumption, and usage at the 100% ceiling does not
+measure additional demand. A same-cycle gap has a known total change, but gaps
+over six hours are not interpolated across a forecast window boundary. Ticks
+are omitted if less than 80% of the available span is usable, if no fresh quota
+response is available, or if their validity time expires (at most 15 minutes,
+and never beyond the quota reset). Missing/corrupt history does not interrupt
+the ordinary usage display. Collection follows the existing BLE bridge
+lifecycle, so an offline device can leave gaps in history.
 
 ## Hardware
 
@@ -279,10 +319,31 @@ OpenAI does not report that window; the firmware renders it as unavailable.
 | `state` | Pet state: `busy`, `idle`, `completed`, `attention`, `dizzy`, `heart`, or `sleep` |
 | `tokens` | Total token usage value read by the bridge |
 | `primary` | Optional 5-hour usage percentage |
-| `secondary` | Required 7-day usage percentage |
+| `secondary` | Optional 7-day usage percentage |
 | `primary_resets_at` | Optional Unix timestamp for primary reset |
 | `secondary_resets_at` | Unix timestamp for secondary reset |
 | `now` | Sender timestamp |
+| `secondary_forecast_48h` | Optional integer forecast: 0–100, or 101 for overflow |
+| `secondary_forecast_14d` | Optional integer forecast: 0–100, or 101 for overflow |
+| `secondary_forecast_valid_until` | Unix expiry timestamp required to display forecast ticks |
+
+Old firmware ignores the added fields. New firmware clears missing forecast
+fields on each quota packet; the bar dimensions, labels, and placement are
+unchanged in both orientations. Updating this feature requires both the bridge
+and firmware, without uploading the pet filesystem.
+
+Forecast verification (no device required):
+
+```bash
+pio run -e m5stack-sticks3
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s plugins/codex-usage-stick/tests -v
+```
+
+The firmware tests compile the production JSON parser and drawing functions
+with host hardware stubs and the PlatformIO-provided ArduinoJson headers. They
+check field validation, expiry, backwards compatibility, marker pixel bounds,
+and unchanged text/layout outside the bar. These checks require a C++ compiler;
+otherwise the host firmware checks are reported as skipped.
 
 ## GIF Character Pack Format
 
