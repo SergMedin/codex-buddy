@@ -4,6 +4,9 @@
 #include "ble_bridge.h"
 #include "xfer.h"
 
+// Signed hundredths of a percentage point; +/-5100 means outside +/-50 pp.
+constexpr int16_t FORECAST_UNAVAILABLE = 32767;
+
 struct TamaState {
   uint8_t  sessionsTotal;
   uint8_t  sessionsRunning;
@@ -17,8 +20,8 @@ struct TamaState {
   bool     codexSecondaryAvailable;
   uint32_t codexPrimaryResetsAt;
   uint32_t codexSecondaryResetsAt;
-  int16_t  codexForecast48h = -1; // -1 unavailable; 101 means beyond 100%
-  int16_t  codexForecast14d = -1;
+  int16_t  codexRemaining48h = FORECAST_UNAVAILABLE;
+  int16_t  codexRemaining14d = FORECAST_UNAVAILABLE;
   uint32_t codexForecastValidUntil = 0;
   char     codexState[16];
   uint32_t lastUpdated;
@@ -102,10 +105,10 @@ static uint8_t _jsonPct(JsonVariant v, uint8_t fallback) {
   return (uint8_t)n;
 }
 
-static int16_t _jsonForecast(JsonVariant v) {
-  if (!v.is<int>()) return -1;
+static int16_t _jsonRemaining(JsonVariant v) {
+  if (!v.is<int>()) return FORECAST_UNAVAILABLE;
   int n = v.as<int>();
-  return n >= 0 && n <= 101 ? (int16_t)n : -1;
+  return n >= -5100 && n <= 5100 ? (int16_t)n : FORECAST_UNAVAILABLE;
 }
 
 inline bool dataForecastActive(const TamaState& state) {
@@ -181,8 +184,9 @@ static void _applyJson(const char* line, TamaState* out) {
       out->codexSecondary = _jsonPct(doc["secondary"], out->codexSecondary);
       out->codexSecondaryResetsAt = doc["secondary_resets_at"].as<uint32_t>();
     }
-    out->codexForecast48h = hasSecondary ? _jsonForecast(doc["secondary_forecast_48h"]) : -1;
-    out->codexForecast14d = hasSecondary ? _jsonForecast(doc["secondary_forecast_14d"]) : -1;
+    // Legacy overflow (101) has lost its magnitude: never infer a remainder from it.
+    out->codexRemaining48h = hasSecondary ? _jsonRemaining(doc["secondary_remaining_48h_bp"]) : FORECAST_UNAVAILABLE;
+    out->codexRemaining14d = hasSecondary ? _jsonRemaining(doc["secondary_remaining_14d_bp"]) : FORECAST_UNAVAILABLE;
     out->codexForecastValidUntil = hasSecondary && doc["secondary_forecast_valid_until"].is<uint32_t>()
                                 ? doc["secondary_forecast_valid_until"].as<uint32_t>() : 0;
 

@@ -1,6 +1,7 @@
 #include <M5Unified.h>
 #include <LittleFS.h>
 #include <stdarg.h>
+#include <math.h>
 #include "ble_bridge.h"
 static void appRtcSynced(time_t localEpoch);
 #include "data.h"
@@ -26,7 +27,7 @@ const int W = 135, H = 240;
 const int CX = W / 2;
 const int CY_BASE = 120;
 const int USAGE_PET_TOP = 26;
-const int USAGE_PET_H = 100;
+const int USAGE_PET_H = 94; // Leave the forecast title clear of the pet canvas.
 const int USAGE_PET_BOTTOM = USAGE_PET_TOP + USAGE_PET_H;
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 const int LED_PIN = -1;          // no user LED on StickS3
@@ -718,16 +719,16 @@ void drawInfo() {
     ln("usage over BLE.");
     y += 6;
     ln("The home screen shows");
-    ln("tokens plus short and");
-    ln("long usage windows.");
+    ln("weekly usage and quota");
+    ln("left at reset (pp).");
     y += 6;
     spr.setTextColor(p.text, p.bg);
-    ln("Primary is fixed 5h.");
-    ln("Secondary is fixed 7d.");
+    ln("Cyan: recent pace.");
+    ln("Pink: longer history.");
     y += 6;
     spr.setTextColor(p.textDim, p.bg);
-    ln("Pet GIFs are paused");
-    ln("for this first build.");
+    ln("Left: quota to spare.");
+    ln("Right: over budget.");
 
   } else if (infoPage == 1) {
     _infoHeader(p, y, "BUTTONS", infoPage);
@@ -1137,28 +1138,78 @@ static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
   }
 }
 
-// All marker pixels stay inside the existing 13px bar, including overflow.
-static void drawForecastTick(lgfx::v1::LGFXBase* dst, int bx, int by, int bw,
-                             int forecast, bool upper) {
-  if (forecast < 0 || forecast > 101 || bw < 8) return;
-  int position = forecast > 100 ? 100 : forecast;
-  int mx = bx + 1 + (bw - 4) * position / 100;
-  int my = by + (upper ? 1 : 7);
-  uint16_t color = upper ? 0x07FF : 0xF81F; // cyan: 48h; magenta: 14d
-  if (mx > bx + 1) dst->fillRect(mx - 1, my, 1, 5, 0x0000);
-  if (mx + 2 < bx + bw - 1) dst->fillRect(mx + 2, my, 1, 5, 0x0000);
-  dst->fillRect(mx, my, 2, 5, color);
-  if (forecast > 100) {
-    // Right-pointing chevron at the ceiling, distinct from exactly 100%.
-    dst->drawLine(mx - 2, my, mx + 1, my + 2, color);
-    dst->drawLine(mx - 2, my + 4, mx + 1, my + 2, color);
+// Symmetric log1p scale: positive remainder on the left, deficit on the right.
+// Input is hundredths of a percentage point, not the rounded legacy forecast.
+static int forecastPosition(int x, int w, int remainingBp) {
+  const int left = x + 3, right = x + w - 4;
+  const float center = (left + right) / 2.0f;
+  const int magnitude = abs(remainingBp) > 5000 ? 5000 : abs(remainingBp);
+  const float offset = log1pf(magnitude / 100.0f) / log1pf(50.0f) * (right - left) / 2.0f;
+  return lroundf(center + (remainingBp < 0 ? offset : -offset));
+}
+
+static void drawForecastMarker(lgfx::v1::LGFXBase* dst, int x, int axis, int w,
+                               int remainingBp, bool upper) {
+  if (remainingBp < -5100 || remainingBp > 5100) return;
+  const int px = forecastPosition(x, w, remainingBp);
+  const uint16_t color = upper ? 0x07FF : 0xF81F;
+  if (abs(remainingBp) > 5000) {
+    // Rotate the 5x10 triangle outward and move it half its length beyond
+    // the end tick. Uses two pixels outside the panel, within screen margins.
+    const int inward = remainingBp > 0 ? 1 : -1;
+    const int cy = axis + (upper ? -7 : 7);
+    for (int column = 0; column < 10; ++column) {
+      const int radius = (2 * column + 4) / 9;
+      dst->fillRect(px + inward * (column - 5), cy - radius, 1, 2 * radius + 1, color);
+    }
+  } else {
+    for (int row = 0; row < 10; ++row) {
+      const int radius = (2 * row + 4) / 9;
+      dst->fillRect(px - radius, axis + (upper ? -2 - row : 2 + row),
+                    2 * radius + 1, 1, color);
+    }
   }
+}
+
+static void drawForecastScaleOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
+                                int remaining48h, int remaining14d, const Palette& p) {
+  dst->setTextSize(1);
+  dst->setTextDatum(TC_DATUM);
+  dst->setTextColor(p.text, p.bg);
+  dst->drawString("LEFT AT RESET (pp)", x + w / 2, y);
+  const int axis = y + 32;
+  if (remaining48h == FORECAST_UNAVAILABLE && remaining14d == FORECAST_UNAVAILABLE) {
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString("NO FORECAST", x + w / 2, axis - 3);
+    dst->setTextDatum(TL_DATUM);
+    return;
+  }
+  dst->drawLine(x + 3, axis, x + w - 4, axis, p.textDim);
+  const int ticks[] = {50,40,30,20,10,5,4,3,2,1,0,-1,-2,-3,-4,-5,-10,-20,-30,-40,-50};
+  for (int value : ticks) {
+    const int px = forecastPosition(x, w, value * 100);
+    const int height = (value == 0 || abs(value) == 10 || abs(value) == 50) ? 13 : 7;
+    dst->fillRect(px, axis - height / 2, 1, height, value == 0 ? 0xFFFF : p.textDim);
+  }
+  dst->setTextColor(p.textDim, p.bg);
+  dst->setTextDatum(TL_DATUM);
+  dst->drawString("+50", x, y + 14);
+  dst->setTextDatum(TR_DATUM);
+  dst->drawString("-50", x + w, y + 14);
+  dst->setTextDatum(TC_DATUM);
+  dst->drawString("+10", forecastPosition(x, w, 1000), axis + 13);
+  dst->drawString("-10", forecastPosition(x, w, -1000), axis + 13);
+  dst->setTextColor(0xFFFF, p.bg);
+  dst->drawString("0", forecastPosition(x, w, 0), y + 14);
+  drawForecastMarker(dst, x, axis, w, remaining48h, true);
+  drawForecastMarker(dst, x, axis, w, remaining14d, false);
+  dst->setTextDatum(TL_DATUM);
 }
 
 static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
                              uint8_t pct, const char* windowLabel,
                              uint32_t resetAt, bool live, bool available,
-                             const Palette& p, int forecast48h = -1, int forecast14d = -1) {
+                             const Palette& p) {
   if (pct > 100) pct = 100;
   bool active = live && available;
   uint16_t fill = active ? usageColor(pct, p) : p.textDim;
@@ -1178,10 +1229,6 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
   dst->fillRect(bx + 1, by + 1, bw - 2, bh - 2, p.bg);
   int fw = (int)((uint32_t)(bw - 2) * pct / 100);
   if (active && fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
-  if (active) {
-    drawForecastTick(dst, bx, by, bw, forecast48h, true);
-    drawForecastTick(dst, bx, by, bw, forecast14d, false);
-  }
 
   dst->setTextSize(1);
   dst->setTextDatum(TL_DATUM);
@@ -1211,15 +1258,14 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
 
 static void drawUsageMeter(int y, uint8_t pct, const char* windowLabel,
                            uint32_t resetAt, bool live, bool available,
-                           const Palette& p, int forecast48h = -1, int forecast14d = -1) {
+                           const Palette& p) {
   drawUsageMeterOn(&spr, 8, y, W - 16, pct, windowLabel, resetAt,
-                   live, available, p, forecast48h, forecast14d);
+                   live, available, p);
 }
 
 static void drawUsageDashboard() {
   const Palette& p = characterPalette();
   bool live = tama.connected;
-  uint8_t primary = live ? tama.codexPrimary : 0;
   uint8_t secondary = live ? tama.codexSecondary : 0;
 
   if (!usageLiveKnown || usageLastLive != live) {
@@ -1253,12 +1299,12 @@ static void drawUsageDashboard() {
     spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
   }
 
-  drawUsageMeter(122, primary, "5h", live ? tama.codexPrimaryResetsAt : 0,
-                 live, tama.codexPrimaryAvailable, p);
+  const bool forecastActive = dataForecastActive(tama);
+  drawForecastScaleOn(&spr, 8, 123, W - 16,
+                       forecastActive ? tama.codexRemaining48h : FORECAST_UNAVAILABLE,
+                       forecastActive ? tama.codexRemaining14d : FORECAST_UNAVAILABLE, p);
   drawUsageMeter(184, secondary, "7d", live ? tama.codexSecondaryResetsAt : 0,
-                 live, tama.codexSecondaryAvailable, p,
-                 dataForecastActive(tama) ? tama.codexForecast48h : -1,
-                 dataForecastActive(tama) ? tama.codexForecast14d : -1);
+                 live, tama.codexSecondaryAvailable, p);
 
   spr.setTextDatum(TL_DATUM);
 }
@@ -1266,14 +1312,12 @@ static void drawUsageDashboard() {
 static void drawUsageDashboardLandscape() {
   const Palette& p = characterPalette();
   bool live = tama.connected;
-  uint8_t primary = live ? tama.codexPrimary : 0;
   uint8_t secondary = live ? tama.codexSecondary : 0;
-  uint32_t primaryReset = live ? tama.codexPrimaryResetsAt : 0;
   uint32_t secondaryReset = live ? tama.codexSecondaryResetsAt : 0;
-  bool primaryAvailable = tama.codexPrimaryAvailable;
   bool secondaryAvailable = tama.codexSecondaryAvailable;
-  int forecast48h = dataForecastActive(tama) ? tama.codexForecast48h : -1;
-  int forecast14d = dataForecastActive(tama) ? tama.codexForecast14d : -1;
+  const bool forecastActive = dataForecastActive(tama);
+  int remaining48h = forecastActive ? tama.codexRemaining48h : FORECAST_UNAVAILABLE;
+  int remaining14d = forecastActive ? tama.codexRemaining14d : FORECAST_UNAVAILABLE;
 
   if (!usageLiveKnown || usageLastLive != live) {
     usageLiveKnown = true;
@@ -1295,14 +1339,11 @@ static void drawUsageDashboardLandscape() {
   }
 
   static bool cachedLive = false;
-  static uint8_t cachedPrimary = 0xFF;
   static uint8_t cachedSecondary = 0xFF;
-  static uint32_t cachedPrimaryReset = 0xFFFFFFFF;
   static uint32_t cachedSecondaryReset = 0xFFFFFFFF;
-  static bool cachedPrimaryAvailable = false;
   static bool cachedSecondaryAvailable = false;
-  static int cachedForecast48h = -1;
-  static int cachedForecast14d = -1;
+  static int cachedRemaining48h = FORECAST_UNAVAILABLE;
+  static int cachedRemaining14d = FORECAST_UNAVAILABLE;
   static uint8_t cachedOrient = 0;
   static uint8_t cachedPetState = 0xFF;
   static int cachedPetW = 0;
@@ -1310,14 +1351,11 @@ static void drawUsageDashboardLandscape() {
   bool panelChanged = repaint
                    || cachedOrient != clockOrient
                    || cachedLive != live
-                   || cachedPrimary != primary
                    || cachedSecondary != secondary
-                   || cachedPrimaryReset != primaryReset
                    || cachedSecondaryReset != secondaryReset
-                   || cachedPrimaryAvailable != primaryAvailable
                    || cachedSecondaryAvailable != secondaryAvailable
-                   || cachedForecast48h != forecast48h
-                   || cachedForecast14d != forecast14d;
+                   || cachedRemaining48h != remaining48h
+                   || cachedRemaining14d != remaining14d;
 
   if (panelChanged) {
     M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
@@ -1329,20 +1367,16 @@ static void drawUsageDashboardLandscape() {
     M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
     M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 7);
 
-    drawUsageMeterOn(&M5.Lcd, rightX, 27, rightW, primary, "5h",
-                     primaryReset, live, primaryAvailable, p);
+    drawForecastScaleOn(&M5.Lcd, rightX, 27, rightW, remaining48h, remaining14d, p);
     drawUsageMeterOn(&M5.Lcd, rightX, 81, rightW, secondary, "7d",
-                     secondaryReset, live, secondaryAvailable, p, forecast48h, forecast14d);
+                     secondaryReset, live, secondaryAvailable, p);
 
     cachedLive = live;
-    cachedPrimary = primary;
     cachedSecondary = secondary;
-    cachedPrimaryReset = primaryReset;
     cachedSecondaryReset = secondaryReset;
-    cachedPrimaryAvailable = primaryAvailable;
     cachedSecondaryAvailable = secondaryAvailable;
-    cachedForecast48h = forecast48h;
-    cachedForecast14d = forecast14d;
+    cachedRemaining48h = remaining48h;
+    cachedRemaining14d = remaining14d;
     cachedOrient = clockOrient;
   }
 

@@ -21,6 +21,8 @@ T = 1_800_000_000
 SHORT = "secondary_forecast_48h"
 LONG = "secondary_forecast_14d"
 TTL = "secondary_forecast_valid_until"
+REMAINING_SHORT = "secondary_remaining_48h_bp"
+REMAINING_LONG = "secondary_remaining_14d_bp"
 KEY = ["codex", "account-v1:test-account"]
 
 
@@ -169,7 +171,36 @@ class QuotaForecastTest(unittest.TestCase):
 
     def test_exactly_100_is_not_overflow(self):
         self.observe(0, 30)
-        self.assertEqual(self.observe(DAY, 40)[SHORT], 100)
+        fields = self.observe(DAY, 40)
+        self.assertEqual(fields[SHORT], 100)
+        self.assertEqual(fields[REMAINING_SHORT], 0)
+
+    def test_remaining_precision_and_strict_scale_boundaries(self):
+        # Observe one hour at a known rate, then extrapolate to the reset.
+        # Recreate the history so each case is independent.
+        for projected, expected in ((0, 5100), (49.999, 5100), (50, 5000),
+                                    (99.75, 25), (100, 0), (100.25, -25),
+                                    (101, -100), (149.999, -5000),
+                                    (150, -5000), (150.001, -5100), (290, -5100)):
+            with self.subTest(projected=projected):
+                self.history.points = []
+                # Current usage stays valid even for projections above 100%.
+                current = projected / 2
+                if current > 100:
+                    current = projected / 4
+                    reset = 4 * 3600
+                else:
+                    reset = 2 * 3600
+                self.observe(0, 0, reset)
+                fields = self.observe(3600, current, reset)
+                self.assertEqual(fields[REMAINING_SHORT], expected)
+                self.assertEqual(fields[REMAINING_LONG], expected)
+
+    def test_remaining_is_omitted_when_its_horizon_is_unavailable(self):
+        self.observe(0, 10)
+        fields = self.observe(3 * DAY, 40)
+        self.assertNotIn(REMAINING_SHORT, fields)
+        self.assertEqual(fields[REMAINING_LONG], 2000)
 
     def test_temporary_decrease_does_not_double_count(self):
         self.observe(0, 40)
@@ -415,6 +446,8 @@ class QuotaForecastTest(unittest.TestCase):
         self.assertEqual(packet["tokens"], 999)
         self.assertEqual(packet[SHORT], 80)
         self.assertEqual(packet[LONG], 80)
+        self.assertEqual(packet[REMAINING_SHORT], 2000)
+        self.assertEqual(packet[REMAINING_LONG], 2000)
         self.assertLess(len(json.dumps(packet).encode()), 512)
 
 

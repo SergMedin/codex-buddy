@@ -340,6 +340,14 @@ class QuotaForecast:
             forecast = p + consumed / covered * (r - now)
             # 101 is an overflow indicator, not a literal prediction of 101%.
             fields[name] = 101 if forecast > 100 else max(p, round(forecast))
+            # Preserve precision around zero for the remaining-quota scale.
+            # Saturate only outside its range, before rounding, so even a tiny
+            # overshoot remains distinct from exactly +/-50 pp. Old fields above
+            # remain available to devices running the previous firmware.
+            remaining = 100 - forecast
+            remaining_bp = (5100 if remaining > 50 else -5100 if remaining < -50
+                            else round(remaining * 100))
+            fields[name.replace("forecast", "remaining") + "_bp"] = remaining_bp
         if fields:
             fields["secondary_forecast_valid_until"] = min(r, int(t + self.TTL_SECONDS))
         return fields

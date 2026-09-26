@@ -62,6 +62,38 @@ After flashing, the device should advertise as:
 Codex-XXXX
 ```
 
+### Updating only the forecast display
+
+For an existing Codex Buddy, build and upload **firmware only**:
+
+```bash
+pio device list
+pio run -e m5stack-sticks3
+pio run -e m5stack-sticks3 -t upload --upload-port /dev/cu.usbmodemXXXXX
+```
+
+Replace the port with the connected StickS3's port from `pio device list`.
+Do not run `erase` or `uploadfs` for this update: the partition layout and pet
+assets are unchanged. If automatic download-mode entry fails, keep USB connected
+and hold the lower-left side power/reset button until the internal green LED
+blinks, then release and retry. This is the manufacturer's
+[StickS3 download-mode procedure](https://docs.m5stack.com/en/arduino/m5sticks3/program).
+After a successful upload, restart the device if it stays in download mode.
+
+Update the installed plugin's bridge to the same revision and restart its
+background process (see section 8). The new scale requires
+`secondary_remaining_48h_bp` / `secondary_remaining_14d_bp`; an older bridge
+leaves it at `NO FORECAST`. Check the bridge log for successful packets with
+these fields. A forecast also requires sufficient fresh usage history.
+
+On the device, check portrait and landscape layouts: `LEFT AT RESET (pp)` above
+the scale, current `7d` usage below it, and no forecast marks on the weekly bar.
+For controlled testing, use temporary quota packets through USB with the BLE
+bridge stopped: remainders `0`, `5000`, `-5000`, `5100`, and `-5100` exercise
+zero, exact endpoints, and outward arrows. Include a future weekly reset and
+forecast expiry. Omitting a remainder hides only that marker; expiry hides both.
+Restart the normal bridge afterwards to restore live quota data.
+
 ## 4. Upload GIF Assets
 
 The firmware reads GIF assets from LittleFS:

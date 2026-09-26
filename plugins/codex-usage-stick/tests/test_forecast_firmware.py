@@ -24,6 +24,7 @@ PRELUDE = r'''
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
 static uint32_t fakeMs = 1000;
 uint32_t millis() { return fakeMs; }
 bool xferCommand(JsonDocument&) { return false; }
@@ -62,7 +63,7 @@ struct LGFXBase {
 };
 }}
 struct Palette { uint16_t text=0xFFFF, textDim=0x7BEF, bg=0x0000; };
-constexpr int TL_DATUM=0, TR_DATUM=1;
+constexpr int TL_DATUM=0, TR_DATUM=1, TC_DATUM=2;
 uint16_t usageColor(uint8_t pct,const Palette&) {return pct<35?0x001F:pct<70?0x07E0:0xFD20;}
 uint16_t resetColor(uint32_t,const char*,bool,const Palette&) {return 0x07E0;}
 void resetTimeText(uint32_t,char* out,size_t n) {snprintf(out,n,"3d 00h");}
@@ -73,72 +74,118 @@ int main(int argc, char** argv) {
   assert(argc==2);
   if(std::string(argv[1])=="parser") {
     TamaState s{};
-    assert(s.codexForecast48h==-1 && s.codexForecast14d==-1);
-    const char* packet=R"({"state":"idle","now":1800000000,"secondary":40,"secondary_resets_at":1800003600,"secondary_forecast_48h":85,"secondary_forecast_14d":64,"secondary_forecast_valid_until":1800000900})";
+    assert(s.codexRemaining48h==FORECAST_UNAVAILABLE && s.codexRemaining14d==FORECAST_UNAVAILABLE);
+    const char* packet=R"({"state":"idle","now":1800000000,"secondary":40,"secondary_resets_at":1800003600,"secondary_remaining_48h_bp":-125,"secondary_remaining_14d_bp":3600,"secondary_forecast_valid_until":1800000900})";
     _applyJson(packet,&s); s.connected=true;
-    assert(s.codexSecondary==40 && s.codexForecast48h==85 && s.codexForecast14d==64);
+    assert(s.codexSecondary==40 && s.codexRemaining48h==-125 && s.codexRemaining14d==3600);
     assert(dataForecastActive(s));
     fakeMs += 900000;
-    assert(!dataForecastActive(s)); // Even if other packets keep BLE alive.
+    assert(!dataForecastActive(s));
     fakeMs=1000;
     _applyJson(packet,&s);
     dataSetDemo(true); assert(!dataForecastActive(s)); dataSetDemo(false);
     s.connected=false; assert(!dataForecastActive(s)); s.connected=true;
     _applyJson(R"({"state":"idle","secondary":40,"secondary_resets_at":1800003600})",&s);
-    assert(s.codexForecast48h==-1 && s.codexForecast14d==-1 && !dataForecastActive(s));
+    assert(s.codexRemaining48h==FORECAST_UNAVAILABLE && s.codexRemaining14d==FORECAST_UNAVAILABLE && !dataForecastActive(s));
     _applyJson(packet,&s);
     _applyJson(R"({"state":"idle"})",&s);
-    assert(!s.codexSecondaryAvailable && s.codexForecast48h==-1 && s.codexForecast14d==-1);
-    for(const char* value: {"null","true","\"85\"","-1","102","85.5","9999999999999999"}) {
+    assert(!s.codexSecondaryAvailable && s.codexRemaining48h==FORECAST_UNAVAILABLE && s.codexRemaining14d==FORECAST_UNAVAILABLE);
+    for(const char* value: {"null","true", "false", "\"85\"","-5101","5101","85.5","9999999999999999","1e50"}) {
       std::string bad=std::string("{\"v\":")+value+"}";
       JsonDocument doc; deserializeJson(doc,bad);
-      assert(_jsonForecast(doc["v"])==-1);
+      assert(_jsonRemaining(doc["v"])==FORECAST_UNAVAILABLE);
     }
-    for(int n: {0,64,100,101}) {
-      JsonDocument doc; doc["v"]=n; assert(_jsonForecast(doc["v"])==n);
+    for(int n: {-5100,-5000,-100,-1,0,1,100,5000,5100}) {
+      JsonDocument doc; doc["v"]=n; assert(_jsonRemaining(doc["v"])==n);
     }
+    // Old overflow value cannot be converted into a meaningful position.
+    _applyJson(R"({"state":"idle","secondary":40,"secondary_resets_at":1800003600,"secondary_forecast_48h":101,"secondary_forecast_14d":80,"secondary_forecast_valid_until":1800000900})",&s);
+    assert(s.codexRemaining48h==FORECAST_UNAVAILABLE && s.codexRemaining14d==FORECAST_UNAVAILABLE);
+    _applyJson(R"({"state":"idle","secondary":40,"secondary_resets_at":1800003600,"secondary_remaining_48h_bp":0,"secondary_forecast_valid_until":1800000900})",&s);
+    assert(s.codexRemaining48h==0 && s.codexRemaining14d==FORECAST_UNAVAILABLE);
     _applyJson(packet,&s); s.codexSecondaryResetsAt=1800000000;
     assert(!dataForecastActive(s));
   } else if(std::string(argv[1])=="pixels") {
-    for(int w: {8,119,120}) for(int forecast=-1;forecast<=102;++forecast) {
-      lgfx::v1::LGFXBase dst;
-      drawForecastTick(&dst,8,100,w,forecast,true);
-      drawForecastTick(&dst,8,100,w,forecast,false);
-      bool cyan=false, magenta=false;
-      for(int y=0;y<240;++y) for(int x=0;x<240;++x) {
-        int c=dst.pixels[y*240+x]; if(c==-1) continue;
-        assert(forecast>=0 && forecast<=101);
-        assert(x>8 && x<8+w-1 && y>100 && y<112);
-        if(c==0x07FF) {cyan=true; assert(y<=105);}
-        if(c==0xF81F) {magenta=true; assert(y>=107);}
+    for(bool landscape: {false,true}) {
+      int x=landscape?112:8, w=landscape?120:119, axis=landscape?59:155;
+      int screenW=landscape?240:135;
+      assert(forecastPosition(x,w,5000)==x+3);
+      assert(forecastPosition(x,w,-5000)==x+w-4);
+      for(int bp=-5000;bp<5000;++bp)
+        assert(forecastPosition(x,w,bp)>=forecastPosition(x,w,bp+1));
+      assert(forecastPosition(x,w,0)-forecastPosition(x,w,100) >
+             forecastPosition(x,w,4900)-forecastPosition(x,w,5000));
+      for(int bp: {-5101,-5100,-5001,-5000,-1000,-500,-100,-1,0,1,100,500,1000,5001,5000,5100,5101,int(FORECAST_UNAVAILABLE)}) {
+        lgfx::v1::LGFXBase dst;
+        drawForecastMarker(&dst,x,axis,w,bp,true);
+        drawForecastMarker(&dst,x,axis,w,bp,false);
+        for(int color: {0x07FF,0xF81F}) {
+          int minX=240,maxX=-1,minY=240,maxY=-1;
+          for(int yy=0;yy<240;++yy) for(int xx=0;xx<240;++xx) {
+            if(dst.pixels[yy*240+xx]!=color) continue;
+            assert(xx>=0 && xx<screenW);
+            assert(xx>=x-2 && xx<=x+w+1);
+            assert(color==0x07FF ? yy<axis : yy>axis);
+            minX=std::min(minX,xx);maxX=std::max(maxX,xx);
+            minY=std::min(minY,yy);maxY=std::max(maxY,yy);
+          }
+          if(abs(bp)>5100) { assert(maxX==-1); continue; }
+          bool overflow=abs(bp)>5000;
+          assert(maxX-minX+1==(overflow?10:5));
+          assert(maxY-minY+1==(overflow?5:10));
+          if(overflow) {
+            int cy=axis+(color==0x07FF?-7:7);
+            int tip=bp>0?x-2:x+w+1;
+            assert(dst.pixels[cy*240+tip]==color);
+            assert(dst.pixels[(cy-1)*240+tip]!=color);
+            assert(dst.pixels[(cy+1)*240+tip]!=color);
+          }
+        }
       }
-      assert(cyan==(forecast>=0 && forecast<=101));
-      assert(magenta==(forecast>=0 && forecast<=101));
     }
-    lgfx::v1::LGFXBase ceiling, overflow;
-    drawForecastTick(&ceiling,8,100,119,100,true);
-    drawForecastTick(&overflow,8,100,119,101,true);
-    assert(ceiling.pixels!=overflow.pixels);
   } else if(std::string(argv[1])=="layout") {
     Palette p; dataSyncUtc(1800000000);
-    for(bool landscape: {false,true}) for(int pct: {0,34,35,69,70,100}) {
-      int x=landscape?112:8, y=landscape?81:184, w=landscape?120:119;
-      lgfx::v1::LGFXBase original, marked;
-      drawUsageMeterOn(&original,x,y,w,pct,"7d",1800003600,true,true,p);
-      drawUsageMeterOn(&marked,x,y,w,pct,"7d",1800003600,true,true,p,85,64);
-      assert(original.text==marked.text);
+    for(bool landscape: {false,true}) {
+      int x=landscape?112:8, y=landscape?27:123, w=landscape?120:119;
+      int weeklyY=landscape?81:184;
+      lgfx::v1::LGFXBase dst, missing;
+      drawForecastScaleOn(&dst,x,y,w,5100,-5100,p);
+      drawForecastScaleOn(&missing,x,y,w,FORECAST_UNAVAILABLE,FORECAST_UNAVAILABLE,p);
+      bool unavailable=false;
+      for(auto& text: missing.text) if(text.find("NO FORECAST:")==0) unavailable=true;
+      assert(unavailable);
       for(int yy=0;yy<240;++yy) for(int xx=0;xx<240;++xx) {
-        if(original.pixels[yy*240+xx]==marked.pixels[yy*240+xx]) continue;
-        assert(xx>x && xx<x+w-1 && yy>y+24 && yy<y+36);
+        assert(missing.pixels[yy*240+xx]==-1);
+        if(dst.pixels[yy*240+xx]!=-1) assert(yy>=y && yy<weeklyY);
       }
-      lgfx::v1::LGFXBase offline, offlineMarked;
-      drawUsageMeterOn(&offline,x,y,w,pct,"7d",1800003600,false,true,p);
-      drawUsageMeterOn(&offlineMarked,x,y,w,pct,"7d",1800003600,false,true,p,85,64);
-      assert(offline.pixels==offlineMarked.pixels && offline.text==offlineMarked.text);
+      // Inspect ticks away from the two forecast markers.
+      lgfx::v1::LGFXBase ticks;
+      drawForecastScaleOn(&ticks,x,y,w,250,-250,p);
+      // All labelled major ticks are thirteen pixels, with their original gray.
+      for(int bp: {-5000,-1000,1000,5000}) {
+        int px=forecastPosition(x,w,bp), axis=y+32;
+        for(int dy=-6;dy<=6;++dy) assert(ticks.pixels[(axis+dy)*240+px]==p.textDim);
+        assert(ticks.pixels[(axis-7)*240+px]==-1);
+        assert(ticks.pixels[(axis+7)*240+px]==-1);
+      }
+      for(int bp: {-4000,-3000,-2000,-100,100,2000,3000,4000}) {
+        int px=forecastPosition(x,w,bp), axis=y+32;
+        for(int dy=-3;dy<=3;++dy) assert(ticks.pixels[(axis+dy)*240+px]==p.textDim);
+        assert(ticks.pixels[(axis-4)*240+px]==-1);
+        assert(ticks.pixels[(axis+4)*240+px]==-1);
+      }
+      int center=forecastPosition(x,w,0);
+      for(int dy=-6;dy<=6;++dy) assert(dst.pixels[(y+32+dy)*240+center]==0xFFFF);
+      for(int pct: {0,34,35,69,70,100}) {
+        lgfx::v1::LGFXBase weekly;
+        drawUsageMeterOn(&weekly,x,weeklyY,w,pct,"7d",1800003600,true,true,p);
+        for(int pixel: weekly.pixels) assert(pixel!=0x07FF && pixel!=0xF81F);
+      }
     }
   } else { assert(false); }
 }
 '''
+
 
 
 class ForecastFirmwareTest(unittest.TestCase):
@@ -149,9 +196,9 @@ class ForecastFirmwareTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         data = (ROOT / "src/data.h").read_text()
-        data = data[data.index("struct TamaState"):data.index("template<size_t N>")]
+        data = data[data.index("// Signed hundredths"):data.index("template<size_t N>")]
         main = (ROOT / "src/main.cpp").read_text()
-        drawing = main[main.index("static void drawForecastTick"):main.index("static void drawUsageMeter(int")]
+        drawing = main[main.index("static int forecastPosition"):main.index("static void drawUsageMeter(int")]
         source = Path(cls.tmp.name) / "check.cpp"
         source.write_text(PRELUDE + data + GRAPHICS + drawing + CHECKS)
         cls.binary = Path(cls.tmp.name) / "check"
@@ -161,10 +208,10 @@ class ForecastFirmwareTest(unittest.TestCase):
     def test_firmware_packet_validation_expiry_and_legacy_compatibility(self):
         subprocess.run([str(self.binary), "parser"], check=True, capture_output=True)
 
-    def test_markers_stay_inside_bar_and_remain_distinct_when_overlapping(self):
+    def test_log_scale_and_marker_bounds_in_both_orientations(self):
         subprocess.run([str(self.binary), "pixels"], check=True, capture_output=True)
 
-    def test_both_layouts_keep_all_text_and_pixels_outside_bar_unchanged(self):
+    def test_scale_ticks_missing_data_and_unmarked_weekly_bar(self):
         subprocess.run([str(self.binary), "layout"], check=True, capture_output=True)
 
 
