@@ -47,6 +47,7 @@ SNAPSHOT_CACHE_PATH = STATE_DIR / "last_usage_snapshot.json"
 PRIMARY_WINDOW_MINUTES = 5 * 60
 SECONDARY_WINDOW_MINUTES = 7 * 24 * 60
 APP_SERVER_USAGE_SOURCE = Path("account-rateLimits-read")
+QUOTA_TTL_SECONDS = 900
 
 INTERESTING_LINE_MARKERS = (
     "token_count",
@@ -182,34 +183,66 @@ class UsageSnapshot:
     attention_at: float | None = None
     dizzy_at: float | None = None
     last_activity_at: float | None = None
-    # Fresh quota observation time, separate from task activity. Never cached.
+    # Observation time survives retries/restarts; live is true only for a new
+    # successful API read, never for replayed cache or rollout data.
     quota_observed_at: float | None = None
+    quota_live: bool = False
     quota_log_valid: bool = False
     quota_account: str | None = None
+    # Distinguish a confirmed logout/unknown identity from a source that has
+    # never provided account information. Unscoped logs are unsafe afterwards.
+    account_checked: bool = False
+    auth_scope: str | None = None
+    gift_reset_expires_at: int | None = None
+    gift_observed_at: float | None = None
+
+    def quota_status(self, now: float) -> str:
+        if (self.quota_observed_at is None
+                or not 0 <= now - self.quota_observed_at < QUOTA_TTL_SECONDS
+                or now >= self.secondary_resets_at):
+            return "unavailable"
+        return "fresh" if self.quota_live else "cached"
 
     def packet(self, state: str) -> dict[str, Any]:
-        now = int(time.time())
+        now = time.time()
         packet = {
             "state": state,
             "tokens": self.tokens,
-            "now": now,
+            "now": int(now),
+            "quota_status": self.quota_status(now),
         }
-        if window_is_available(self.primary_resets_at, now):
-            packet["primary"] = self.primary
-            packet["primary_resets_at"] = self.primary_resets_at
-        if window_is_available(self.secondary_resets_at, now):
+        if self.quota_observed_at is not None:
+            packet["quota_observed_at"] = int(self.quota_observed_at)
+            packet["quota_valid_until"] = min(
+                int(self.quota_observed_at + QUOTA_TTL_SECONDS), self.secondary_resets_at)
+        if packet["quota_status"] != "unavailable":
+            if window_is_available(self.primary_resets_at, now):
+                packet["primary"] = self.primary
+                packet["primary_resets_at"] = self.primary_resets_at
             packet["secondary"] = self.secondary
             packet["secondary_resets_at"] = self.secondary_resets_at
+        if self.gift_observed_at is not None:
+            packet["gift_observed_at"] = int(self.gift_observed_at)
+            # A cached credit that has just expired does not prove that no
+            # other credits remain. Await the next complete API snapshot.
+            if (self.gift_reset_expires_at is not None
+                    and (self.gift_reset_expires_at == 0 or self.gift_reset_expires_at > now)):
+                packet["gift_reset_expires_at"] = self.gift_reset_expires_at
         return packet
 
 
 class QuotaForecast:
-    """Optional, bounded history of observed weekly quota (not task tokens)."""
+    """Bounded quota observations [time, used %, deadline, cycle].
 
+    A deadline is API metadata, not a cycle identifier: an unused window can
+    slide until first use. Only same-cycle intervals measure consumption.
+    """
+
+    HISTORY_VERSION = 2
     HORIZONS = {"secondary_forecast_48h": 2 * 86400, "secondary_forecast_14d": 14 * 86400}
     SAMPLE_SECONDS = 300
     MIN_HISTORY_SECONDS = 3600
-    TTL_SECONDS = 900
+    TTL_SECONDS = QUOTA_TTL_SECONDS
     MAX_INTERPOLATION_GAP = 6 * 3600
     MAX_POINTS = 4100
     RESET_TOLERANCE_SECONDS = 5  # API/log reset timestamps can differ by rounding.
@@ -218,34 +251,67 @@ class QuotaForecast:
         self.path = path
         self.key: list[Any] | None = None
         self.points: list[list[float | int]] = []
+        self.status = "unavailable"
+        self._latest: list[float | int] | None = None
+        self._needs_migration = False
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
         try:
-            if path.stat().st_size > 1024 * 1024:
+            if self.path.stat().st_size > 1024 * 1024:
                 return
-            data = json.loads(path.read_text())
-            if not isinstance(data, dict) or data.get("version") != 1:
+            data = json.loads(self.path.read_text())
+            if not isinstance(data, dict) or data.get("version") not in (1, self.HISTORY_VERSION):
                 return
+            version = data["version"]
             points = data.get("points")
             if not isinstance(points, list) or len(points) > self.MAX_POINTS:
                 return
-            previous = 0.0
             previous_point = None
             for point in points:
-                if not isinstance(point, list) or len(point) != 3:
+                if not self._valid_point(point, version, previous_point):
                     return
-                t, p, r = point
-                if not all(type(v) in (int, float) and math.isfinite(v) for v in point):
-                    return
-                if not previous < t < r <= t + 7 * 86400 or not 0 <= p <= 100:
-                    return
-                if previous_point is not None:
-                    if r == previous_point[2] and p < previous_point[1]:
-                        return
-                previous = t
                 previous_point = point
+            latest = data.get("latest", previous_point)
+            if version == self.HISTORY_VERSION and points:
+                if not self._valid_point(latest, version):
+                    return
+                if latest != previous_point and not self._valid_point(latest, version, previous_point):
+                    return
+            elif version == self.HISTORY_VERSION and latest is not None:
+                return
             self.key = data.get("key")
-            self.points = points
+            if version == 1:
+                # Reclassify old deadline-based cycles and restore the sampling
+                # cadence. Migration does not write until a live observation.
+                for point in points:
+                    self._record(point[0], point[1], point[2])
+                if self._latest and self.points[-1] != self._latest:
+                    self._append(self._latest)
+                self._needs_migration = True
+            else:
+                self.points = points
+                self._latest = latest
         except (OSError, ValueError, TypeError, OverflowError):
             pass
+
+    def _valid_point(self, point: Any, version: int,
+                     previous: list[float | int] | None = None) -> bool:
+        if not isinstance(point, list) or len(point) != (3 if version == 1 else 4):
+            return False
+        if not all(type(v) in (int, float) and math.isfinite(v) for v in point):
+            return False
+        t, p, r = point[:3]
+        if not 0 < t < r <= t + 7 * 86400 + self.RESET_TOLERANCE_SECONDS or not 0 <= p <= 100:
+            return False
+        if version == self.HISTORY_VERSION and (type(point[3]) is not int or point[3] < 0):
+            return False
+        if previous is None:
+            return True
+        same_cycle = r == previous[2] if version == 1 else point[3] == previous[3]
+        return (t > previous[0] and (not same_cycle or p >= previous[1])
+                and (version == 1 or point[3] >= previous[3]))
 
     def seed(self, current: UsageSnapshot, logs: list[UsageSnapshot],
              key: list[Any], earliest: float = 0) -> None:
@@ -265,7 +331,9 @@ class QuotaForecast:
             if points and (s.event_ts - points[-1][0] < self.SAMPLE_SECONDS or s.secondary < points[-1][1]):
                 continue
             points.append([s.event_ts, s.secondary, r])
-        self.key, self.points = key, points[-self.MAX_POINTS:]
+        self.key, self.points, self._latest = key, [], None
+        for t, p, r in points:
+            self._record(t, p, r)
         self.save()
 
     def save(self) -> None:
@@ -274,49 +342,80 @@ class QuotaForecast:
         try:
             with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as f:
                 temp_path = Path(f.name)
-                json.dump({"version": 1, "key": self.key, "points": self.points}, f,
+                json.dump({"version": self.HISTORY_VERSION, "key": self.key,
+                           "points": self.points, "latest": self._latest}, f,
                           separators=(",", ":"), allow_nan=False)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_path, self.path)
+            self._needs_migration = False
+            self._dirty = False
         finally:
             if temp_path is not None:
                 with contextlib.suppress(OSError):
                     temp_path.unlink(missing_ok=True)
 
-    def packet_fields(self, snapshot: UsageSnapshot, now: float, key: list[Any]) -> dict[str, int]:
-        t = snapshot.quota_observed_at
-        p, r = snapshot.secondary, snapshot.secondary_resets_at
-        if t is None or not all(math.isfinite(v) for v in (t, p, r, now)):
-            return {}
-        if not 0 <= now - t < self.TTL_SECONDS or not 0 <= p <= 100 or not now < r <= t + 7 * 86400:
-            return {}
-        if key != self.key:
-            self.key, self.points = key, []
-        if self.points:
-            last_t, last_p, last_r = self.points[-1]
-            if abs(r - last_r) <= self.RESET_TOLERANCE_SECONDS:
-                r = last_r
-                if r <= now:
-                    return {}
-            # Late measurements never erase history. Reset boundaries only break
-            # the interval between samples, including early/manual resets.
-            if t < last_t or (t == last_t and (p != last_p or r != last_r)):
-                return {}
-            if r == last_r and p < last_p:
-                # Keep the high-water mark: 40 -> 0 -> 40 must not count twice.
-                return {}
+    def _classify(self, t: float, p: float, r: int) -> tuple[bool, bool]:
+        """Return (cycle boundary, confirmed reset), independently of sampling."""
+        if self._latest is None:
+            return False, False
+        _, last_p, last_r, _ = self._latest
+        elapsed = t >= last_r
+        moved = abs(r - last_r) > self.RESET_TOLERANCE_SECONDS
+        # A changed deadline after positive usage could hide a reset even if
+        # the new percentage has caught up. Exclude that uncertain interval.
+        # An unused window may slide or anchor on its first use without reset.
+        return elapsed or (moved and last_p > 0), elapsed or (moved and p < last_p)
 
-        point = [t, p, r]
-        changed = not self.points or r != self.points[-1][2] or t - self.points[-1][0] >= self.SAMPLE_SECONDS
-        if changed:
-            self.points.append(point)
-            cutoff = t - max(self.HORIZONS.values())
-            while len(self.points) > 1 and self.points[1][0] <= cutoff:
-                self.points.pop(0)
-            self.points = self.points[-self.MAX_POINTS:]
-            self.save()
-        points = self.points if self.points[-1][0] == t else self.points + [point]
+    def _observation(self, t: float, p: float, r: int) -> tuple[list[float | int] | None, bool]:
+        boundary, confirmed = self._classify(t, p, r)
+        if self._latest:
+            last_t, last_p, last_r, cycle = self._latest
+            if t < last_t or (t == last_t and (p != last_p or r != last_r)):
+                return None, False
+            if not boundary and p < last_p:
+                # A decrease without reset evidence is ambiguous. Reject it
+                # rather than counting the recovery from a transient dip twice.
+                return None, False
+        else:
+            cycle = 0
+        return [t, p, r, cycle + int(boundary)], confirmed
+
+    def _append(self, point: list[float | int]) -> None:
+        self.points.append(point)
+        self._dirty = True
+        cutoff = point[0] - max(self.HORIZONS.values())
+        while len(self.points) > 1 and self.points[1][0] <= cutoff:
+            self.points.pop(0)
+        self.points = self.points[-self.MAX_POINTS:]
+
+    def _record(self, t: float, p: float, r: int) -> list[float | int] | None:
+        point, confirmed = self._observation(t, p, r)
+        if point is None:
+            return None
+        if confirmed and self._latest and self.points[-1] != self._latest:
+            # Preserve the last known interval before the actual reset; only
+            # the interval crossing its boundary is unknown.
+            self._append(self._latest)
+        if (not self.points or confirmed
+                or t - self.points[-1][0] >= self.SAMPLE_SECONDS):
+            self._append(point)
+        elif self._latest and self.points[-1][3] == self._latest[3] and point[3] != self._latest[3]:
+            # Persist the first uncertain boundary without adding a sample.
+            # Further boundaries before the next sample remain one unknown
+            # interval; a restart must never reconnect it to the old cycle.
+            self._dirty = True
+        self._latest = point
+        return point
+
+    def _project(self, point: list[float | int], *, record: bool) -> dict[str, int]:
+        t, p, r, _ = point
+        points = self.points if self.points and self.points[-1] == point else self.points + [point]
+        # Warmup is a specific condition: an accepted live observation and
+        # less than one hour of history. Missing coverage or rejected samples
+        # are not progress toward a forecast and must not claim otherwise.
+        if record and t - points[0][0] < self.MIN_HISTORY_SECONDS:
+            self.status = "learning"
         fields = {}
         for name, horizon in self.HORIZONS.items():
             start = max(points[0][0], t - horizon)
@@ -327,7 +426,7 @@ class QuotaForecast:
             for a, b in zip(points, points[1:]):
                 duration = b[0] - a[0]
                 overlap = b[0] - max(start, a[0])
-                if overlap <= 0 or duration <= 0 or a[2] != b[2] or b[1] < a[1]:
+                if overlap <= 0 or duration <= 0 or a[3] != b[3] or b[1] < a[1]:
                     continue
                 # A whole same-cycle gap has a known total delta, including sleep.
                 # Do not distribute a long unobserved gap across a window boundary.
@@ -337,7 +436,9 @@ class QuotaForecast:
                 consumed += (b[1] - a[1]) * overlap / duration
             if covered < self.MIN_HISTORY_SECONDS or covered < span * 0.8:
                 continue
-            forecast = p + consumed / covered * (r - now)
+            # Replaying the same observation must not make the projection look
+            # better as time passes, or extend its lifetime.
+            forecast = p + consumed / covered * (r - t)
             # 101 is an overflow indicator, not a literal prediction of 101%.
             fields[name] = 101 if forecast > 100 else max(p, round(forecast))
             # Preserve precision around zero for the remaining-quota scale.
@@ -350,12 +451,41 @@ class QuotaForecast:
             fields[name.replace("forecast", "remaining") + "_bp"] = remaining_bp
         if fields:
             fields["secondary_forecast_valid_until"] = min(r, int(t + self.TTL_SECONDS))
+            self.status = "ready"
         return fields
 
+    def packet_fields(self, snapshot: UsageSnapshot, now: float, key: list[Any],
+                      *, record: bool = True) -> dict[str, int]:
+        self.status = "unavailable"
+        t = snapshot.quota_observed_at
+        p, r = snapshot.secondary, snapshot.secondary_resets_at
+        if t is None or not all(math.isfinite(v) for v in (t, p, r, now)):
+            return {}
+        if (not 0 <= now - t < self.TTL_SECONDS or not 0 <= p <= 100
+                or not now < r <= t + 7 * 86400 + self.RESET_TOLERANCE_SECONDS):
+            return {}
+        if key != self.key:
+            if not record:
+                return {}
+            self.key, self.points, self._latest = key, [], None
+        if record:
+            point = self._record(t, p, r)
+            if point is None:
+                return {}
+            if self._needs_migration or self._dirty:
+                self.save()
+                self._dirty = self._needs_migration = False
+        else:
+            point, _ = self._observation(t, p, r)
+            if point is None:
+                return {}
+        return self._project(point, record=record)
 
-def forecast_packet_fields(args: argparse.Namespace, snapshot: UsageSnapshot) -> dict[str, int]:
+
+def forecast_packet_fields(args: argparse.Namespace, snapshot: UsageSnapshot) -> dict[str, Any]:
+    unavailable = {"secondary_forecast_status": "unavailable"}
     if snapshot.quota_observed_at is None or snapshot.quota_account is None:
-        return {}
+        return unavailable
     try:
         history = getattr(args, "_quota_forecast", None)
         if history is None:
@@ -375,16 +505,18 @@ def forecast_packet_fields(args: argparse.Namespace, snapshot: UsageSnapshot) ->
                     history.save()
             except FileNotFoundError:
                 pass
-        if not getattr(args, "_quota_seed_attempted", False):
+        if snapshot.quota_live and not getattr(args, "_quota_seed_attempted", False):
             history.seed(snapshot, getattr(args, "_quota_log_samples", []), key, earliest)
             args._quota_seed_attempted = True
             args._quota_log_samples = []
-        return history.packet_fields(snapshot, time.time(), key)
+        now = time.time()
+        fields = history.packet_fields(snapshot, now, key, record=snapshot.quota_live)
+        return {**fields, "secondary_forecast_status": history.status}
     except Exception as exc:
         # Optional analytics must never interrupt quota/state/approval delivery.
         if args.verbose:
             print(f"[forecast] unavailable: {type(exc).__name__}", file=sys.stderr)
-        return {}
+        return unavailable
 
 
 def window_is_available(reset_at: int, now: int | None = None) -> bool:
@@ -401,10 +533,6 @@ def snapshot_has_rate_limit(snapshot: UsageSnapshot, preferred_limit_id: str) ->
     return limit_matches(snapshot.limit_id, preferred_limit_id) and window_is_available(
         snapshot.secondary_resets_at
     )
-
-
-def snapshot_has_reset_times(snapshot: UsageSnapshot) -> bool:
-    return window_is_available(snapshot.secondary_resets_at)
 
 
 def snapshot_event_key(snapshot: UsageSnapshot) -> float:
@@ -479,25 +607,9 @@ def merge_latest_tokens(snapshot: UsageSnapshot, latest: UsageSnapshot | None) -
     )
 
 
-def merge_latest_rate_limits(snapshot: UsageSnapshot, latest: UsageSnapshot | None) -> UsageSnapshot:
-    if (
-        not latest
-        or not snapshot_has_reset_times(latest)
-        or snapshot_event_key(latest) < snapshot_event_key(snapshot)
-        or latest.limit_id != snapshot.limit_id
-    ):
-        return snapshot
-    return replace(
-        snapshot,
-        primary=latest.primary,
-        secondary=latest.secondary,
-        primary_resets_at=latest.primary_resets_at,
-        secondary_resets_at=latest.secondary_resets_at,
-    )
-
-
 def snapshot_to_cache(snapshot: UsageSnapshot) -> dict[str, Any]:
     return {
+        "version": 2,
         "tokens": snapshot.tokens,
         "primary": snapshot.primary,
         "secondary": snapshot.secondary,
@@ -507,16 +619,39 @@ def snapshot_to_cache(snapshot: UsageSnapshot) -> dict[str, Any]:
         "event_ts": snapshot.event_ts,
         "limit_id": snapshot.limit_id,
         "limit_name": snapshot.limit_name,
-        "saved_at": time.time(),
+        "quota_observed_at": snapshot.quota_observed_at,
+        "quota_account": snapshot.quota_account,
+        "account_checked": snapshot.account_checked,
+        "auth_scope": snapshot.auth_scope,
+        "gift_reset_expires_at": snapshot.gift_reset_expires_at,
+        "gift_observed_at": snapshot.gift_observed_at,
     }
+
+
+def finite_timestamp(value: Any) -> float | None:
+    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+        return float(value)
+    return None
+
+
+def valid_percent(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 100
 
 
 def snapshot_from_cache(path: Path) -> UsageSnapshot | None:
     try:
         data = json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not all(valid_percent(data.get(name)) for name in ("primary", "secondary")):
         return None
     try:
+        # Legacy caches have no authoritative age. Do not infer it from file
+        # mtime or activity, both of which can change without a new quota read.
+        observed = finite_timestamp(data.get("quota_observed_at")) if data.get("version") == 2 else None
+        gift_expiry = finite_timestamp(data.get("gift_reset_expires_at"))
         return UsageSnapshot(
             tokens=int(data.get("tokens") or 0),
             primary=clamp_percent(data.get("primary")),
@@ -527,8 +662,14 @@ def snapshot_from_cache(path: Path) -> UsageSnapshot | None:
             event_ts=float(data["event_ts"]) if data.get("event_ts") is not None else None,
             limit_id=data.get("limit_id"),
             limit_name=data.get("limit_name"),
+            quota_observed_at=observed,
+            quota_account=data.get("quota_account"),
+            account_checked=data.get("account_checked") is True or data.get("quota_account") is not None,
+            auth_scope=data.get("auth_scope"),
+            gift_reset_expires_at=int(gift_expiry) if gift_expiry is not None else None,
+            gift_observed_at=finite_timestamp(data.get("gift_observed_at")),
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -550,6 +691,46 @@ def codex_cli_path(args: argparse.Namespace) -> Path | None:
     return None
 
 
+def auth_scope(args: argparse.Namespace) -> str:
+    """Bind fallback data to a Codex home and its current authentication file.
+
+    Metadata is only a conservative cache invalidation guard, not the account
+    identity used by the forecast. Token refresh may invalidate fallback data;
+    the next successful account/read restores it without losing history.
+    """
+    root = args.codex_home.expanduser().resolve()
+    try:
+        stat = (root / "auth.json").stat()
+        revision = [stat.st_ino, stat.st_mtime_ns, stat.st_size]
+    except OSError:
+        revision = None
+    return hashlib.sha256(json.dumps([str(root), revision]).encode()).hexdigest()
+
+
+def gift_reset_snapshot(result: dict[str, Any], now: float) -> tuple[int | None, float | None]:
+    """A complete credit list proves none; missing/malformed data proves nothing."""
+    summary = result.get("rateLimitResetCredits")
+    if not isinstance(summary, dict) or not isinstance(summary.get("credits"), list):
+        return None, None
+    expires = []
+    for credit in summary["credits"]:
+        if not isinstance(credit, dict) or not isinstance(credit.get("resetType"), str):
+            return None, None
+        if credit["resetType"] != "codexRateLimits":
+            continue
+        status = credit.get("status")
+        if not isinstance(status, str):
+            return None, None
+        if status != "available":
+            continue
+        expiration = finite_timestamp(credit.get("expiresAt"))
+        if expiration is None:
+            return None, None
+        if expiration > now:
+            expires.append(int(expiration))
+    return min(expires, default=0), now
+
+
 def _rate_limit_window(window: Any) -> tuple[int | None, int, int]:
     if not isinstance(window, dict):
         return None, 0, 0
@@ -559,7 +740,7 @@ def _rate_limit_window(window: Any) -> tuple[int | None, int, int]:
         raw_minutes = window.get("windowDurationMins")
     try:
         minutes = int(raw_minutes) if raw_minutes is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         minutes = None
 
     used_percent = window.get("used_percent")
@@ -570,7 +751,7 @@ def _rate_limit_window(window: Any) -> tuple[int | None, int, int]:
         resets_at = window.get("resetsAt")
     try:
         reset = int(resets_at or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         reset = 0
     return minutes, clamp_percent(used_percent), reset
 
@@ -606,8 +787,7 @@ def rate_limit_percentages_valid(rate_limits: dict[str, Any]) -> bool:
     reported = [rate_limits[name] for name in ("primary", "secondary")
                 if isinstance(rate_limits.get(name), dict)]
     percentages = [w.get("used_percent", w.get("usedPercent")) for w in reported]
-    return bool(percentages) and all(type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 100
-                                     for v in percentages)
+    return bool(percentages) and all(valid_percent(v) for v in percentages)
 
 
 def app_server_usage_snapshot_from_result(
@@ -640,11 +820,12 @@ def app_server_usage_snapshot_from_result(
         limit_name=rate_limits.get("limitName"),
     )
     # Only a successful, well-formed live response can extend forecast history.
-    # Preserve the existing display normalization for older/fallback packets.
-    if rate_limit_percentages_valid(rate_limits):
-        snapshot.quota_observed_at = time.time()
-    if not snapshot_has_rate_limit(snapshot, preferred_limit_id):
+    if not rate_limit_percentages_valid(rate_limits) or not snapshot_has_rate_limit(snapshot, preferred_limit_id):
         return None
+    snapshot.quota_observed_at = time.time()
+    snapshot.quota_live = True
+    snapshot.gift_reset_expires_at, snapshot.gift_observed_at = gift_reset_snapshot(
+        result, snapshot.quota_observed_at)
     if activity:
         snapshot = attach_activity(snapshot, activity)
     return snapshot
@@ -664,6 +845,9 @@ def forecast_account_identity(result: dict[str, Any] | None) -> str | None:
 
 
 def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | None) -> UsageSnapshot | None:
+    args._account_read = False
+    args._usage_account = None
+    args._gift_snapshot = (None, None)
     if args.no_appserver_usage:
         return None
 
@@ -742,10 +926,16 @@ def read_app_server_usage(args: argparse.Namespace, activity: UsageSnapshot | No
                     account_received, account_result = True, msg.get("result")
                 elif msg.get("id") == read_msg["id"]:
                     quota_received, quota_result = True, msg.get("result")
+        if account_received and isinstance(account_result, dict):
+            args._account_read = True
+            args._usage_account = forecast_account_identity(account_result)
         if isinstance(quota_result, dict):
+            args._gift_snapshot = gift_reset_snapshot(quota_result, time.time())
             snapshot = app_server_usage_snapshot_from_result(quota_result, args.limit_id, activity)
             if snapshot is not None:
                 snapshot.quota_account = forecast_account_identity(account_result)
+                snapshot.account_checked = args._account_read
+                snapshot.auth_scope = auth_scope(args)
             return snapshot
     except Exception as exc:
         if args.verbose:
@@ -956,7 +1146,7 @@ def choose_best_rate_limit_snapshot(
     preferred_limit_id: str,
     preferred_fresh_window: float = 180.0,
 ) -> UsageSnapshot | None:
-    valid = [s for s in snapshots if snapshot_has_rate_limit(s, preferred_limit_id)]
+    valid = [s for s in snapshots if s.quota_log_valid and snapshot_has_rate_limit(s, preferred_limit_id)]
     if not valid:
         return None
 
@@ -964,6 +1154,39 @@ def choose_best_rate_limit_snapshot(
     fresh = [s for s in valid if latest_ts - snapshot_event_key(s) <= preferred_fresh_window]
     exact = [s for s in fresh if s.limit_id == preferred_limit_id]
     return max(exact or fresh, key=snapshot_event_key)
+
+
+def cached_usage(args: argparse.Namespace) -> UsageSnapshot | None:
+    snapshot = getattr(args, "_last_usage", None)
+    if snapshot is None:
+        snapshot = snapshot_from_cache(args.snapshot_cache_path)
+    if snapshot is None:
+        return None
+    if snapshot.limit_id != args.limit_id or snapshot.auth_scope != auth_scope(args):
+        # Authentication metadata may change during logout or token refresh.
+        # Discard the values, but preserve the fact that unscoped rollout data
+        # is no longer an acceptable account fallback, including after restart.
+        if snapshot.account_checked or snapshot.quota_account is not None:
+            return replace(unavailable_usage(args), account_checked=True)
+        return None
+    return replace(snapshot, quota_live=False)
+
+
+def unavailable_usage(args: argparse.Namespace, activity: UsageSnapshot | None = None) -> UsageSnapshot:
+    snapshot = UsageSnapshot(
+        tokens=activity.tokens if activity else 0,
+        primary=0, secondary=0, primary_resets_at=0, secondary_resets_at=0,
+        source=APP_SERVER_USAGE_SOURCE, event_ts=activity.event_ts if activity else None,
+        limit_id=args.limit_id, limit_name=None, auth_scope=auth_scope(args),
+        quota_account=getattr(args, "_usage_account", None),
+        account_checked=getattr(args, "_account_read", False),
+    )
+    return attach_activity(snapshot, activity) if activity else snapshot
+
+
+def quota_values(snapshot: UsageSnapshot) -> tuple[int, int, int, int]:
+    return (snapshot.primary, snapshot.secondary,
+            snapshot.primary_resets_at, snapshot.secondary_resets_at)
 
 
 def read_usage(args: argparse.Namespace) -> UsageSnapshot:
@@ -984,58 +1207,68 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
     if not getattr(args, "_quota_seed_attempted", False):
         args._quota_log_samples = snapshots
 
-    cached = getattr(read_usage, "_last_valid_snapshot", None)
-    if cached is None:
-        cached = snapshot_from_cache(args.snapshot_cache_path)
-    if cached and not snapshot_has_rate_limit(cached, args.limit_id):
-        cached = None
-    if cached:
-        cached = replace(cached, quota_observed_at=None, quota_account=None)
-
+    cached = cached_usage(args)
     app_server_snapshot = read_app_server_usage(args, latest_any)
+    account_checked = bool(getattr(args, "_account_read", False)
+                           or (cached and (cached.account_checked or cached.quota_account is not None)))
+    if (cached and getattr(args, "_account_read", False)
+            and cached.quota_account != args._usage_account):
+        cached = None
+        args._last_usage = None
+
     if app_server_snapshot:
-        pending = getattr(read_usage, "_pending_zero_quota", None)
-        if pending is None:
-            pending = {}
-            setattr(read_usage, "_pending_zero_quota", pending)
-        stable_snapshot, accepted = stabilize_zero_quota(
-            app_server_snapshot,
-            cached,
-            pending,
-        )
-        if accepted:
-            setattr(read_usage, "_last_valid_snapshot", stable_snapshot)
-            save_snapshot_cache(stable_snapshot, args.snapshot_cache_path)
-        return stable_snapshot if accepted else replace(stable_snapshot, quota_observed_at=None)
+        app_server_snapshot.auth_scope = auth_scope(args)
+        if cached and cached.quota_account != app_server_snapshot.quota_account:
+            cached = None
+        if cached is None:
+            args._pending_zero_quota = {}
+        pending = getattr(args, "_pending_zero_quota", {})
+        args._pending_zero_quota = pending
+        selected, accepted = stabilize_zero_quota(app_server_snapshot, cached, pending)
+        if not accepted:
+            selected = replace(selected, quota_live=False)
+    else:
+        # Rollout events can repeat a cached rate-limit payload on every task
+        # update. They never train the forecast, and identical values cannot
+        # make an already observed quota younger.
+        args._pending_zero_quota = {}
+        try:
+            earliest = (args.codex_home / "auth.json").stat().st_mtime
+        except OSError:
+            earliest = 0
+        # Logs do not identify the account. Once an API account is known, only
+        # its authoritative cache is safe to replay while that source fails.
+        allow_logs = not account_checked
+        candidates = [s for s in snapshots if snapshot_event_key(s) >= earliest] if allow_logs else []
+        best = choose_best_rate_limit_snapshot(candidates, args.limit_id)
+        selected = cached
+        if best and (cached is None or (
+                snapshot_event_key(best) > (cached.quota_observed_at or 0)
+                and quota_values(best) != quota_values(cached))):
+            # Use the earliest copy of these values in this batch, not the
+            # latest task activity timestamp carrying them.
+            observed = min(snapshot_event_key(s) for s in candidates
+                           if s.quota_log_valid and s.limit_id == best.limit_id
+                           and quota_values(s) == quota_values(best))
+            selected = replace(best, quota_observed_at=observed, quota_live=False,
+                               quota_account=None, auth_scope=auth_scope(args))
+        if selected is None:
+            selected = unavailable_usage(args, latest_any)
 
-    best = choose_best_rate_limit_snapshot(snapshots, args.limit_id)
-
-    if best and (not cached or snapshot_event_key(best) >= snapshot_event_key(cached)):
-        if latest_any:
-            best = attach_activity(best, latest_any)
-            best = merge_latest_rate_limits(best, latest_any)
-        setattr(read_usage, "_last_valid_snapshot", best)
-        save_snapshot_cache(best, args.snapshot_cache_path)
-        return merge_latest_tokens(best, latest_any)
-
-    if cached:
-        cached = merge_latest_rate_limits(cached, latest_any)
-        setattr(read_usage, "_last_valid_snapshot", cached)
-        save_snapshot_cache(cached, args.snapshot_cache_path)
-        return merge_latest_tokens(cached, latest_any)
-
-    if best:
-        best = merge_latest_rate_limits(best, latest_any)
-        setattr(read_usage, "_last_valid_snapshot", best)
-        save_snapshot_cache(best, args.snapshot_cache_path)
-        return best
-
-    if latest_any and snapshot_has_rate_limit(latest_any, args.limit_id):
-        return latest_any
-
-    raise RuntimeError(
-        f"No displayable {args.limit_id} quota event found in recent rollout files"
-    )
+    gift_expiry, gift_observed = getattr(args, "_gift_snapshot", (None, None))
+    if gift_observed is not None:
+        selected = replace(selected, gift_reset_expires_at=gift_expiry,
+                           gift_observed_at=gift_observed)
+    elif selected.gift_observed_at is None and cached is not None:
+        selected = replace(selected, gift_reset_expires_at=cached.gift_reset_expires_at,
+                           gift_observed_at=cached.gift_observed_at)
+    selected = merge_latest_tokens(selected, latest_any)
+    if latest_any:
+        selected = attach_activity(selected, latest_any)
+    selected = replace(selected, account_checked=account_checked or selected.account_checked)
+    args._last_usage = selected
+    save_snapshot_cache(selected, args.snapshot_cache_path)
+    return selected
 
 
 def choose_state(args: argparse.Namespace, snapshot: UsageSnapshot, tracker: ActivityTracker) -> str:
@@ -1568,13 +1801,36 @@ async def send_packet(args: argparse.Namespace, packet: dict[str, Any]) -> None:
             await asyncio.sleep(args.chunk_delay)
 
 
+async def poll_usage(args: argparse.Namespace) -> UsageSnapshot:
+    # Reserve half the update deadline for BLE delivery. A slow filesystem/API
+    # poll keeps running once in the background; retries await that same task
+    # instead of spawning competing threads or tearing down the BLE session.
+    pending = getattr(args, "_usage_poll", None)
+    if pending is None:
+        pending = asyncio.create_task(asyncio.to_thread(read_usage, args))
+        args._usage_poll = pending
+    try:
+        return await asyncio.wait_for(asyncio.shield(pending),
+                                      timeout=getattr(args, "update_timeout", 20) / 2)
+    finally:
+        if pending.done():
+            args._usage_poll = None
+
+
 async def send_usage_update(
     args: argparse.Namespace,
     tracker: ActivityTracker,
     ble: BleSession | None = None,
     approvals: CodexApprovalProxy | None = None,
 ) -> None:
-    snapshot = await asyncio.to_thread(read_usage, args)
+    try:
+        snapshot = await poll_usage(args)
+    except Exception as exc:
+        # An unreadable source is a data problem, not a broken BLE connection.
+        # Keep sending honest status so the display can explain the failure.
+        if args.verbose:
+            print(f"[usage] poll failed: {type(exc).__name__}", file=sys.stderr)
+        snapshot = cached_usage(args) or unavailable_usage(args)
 
     state = choose_state(args, snapshot, tracker)
     if approvals and approvals.has_pending():

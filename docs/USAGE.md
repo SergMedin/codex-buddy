@@ -64,6 +64,12 @@ Codex-XXXX
 
 ### Updating only the forecast display
 
+For the Python forecast calculation fix (early resets and moving unused-window
+deadlines), update and restart the running bridge as described in section 8.
+It automatically migrates retained history to format v2. The BLE packet schema
+is unchanged; an existing dashboard firmware does not need to be flashed.
+Migration cannot restore observations already evicted from an older history.
+
 For an existing Codex Buddy, build and upload **firmware only**:
 
 ```bash
@@ -80,18 +86,27 @@ blinks, then release and retry. This is the manufacturer's
 [StickS3 download-mode procedure](https://docs.m5stack.com/en/arduino/m5sticks3/program).
 After a successful upload, restart the device if it stays in download mode.
 
-Update the installed plugin's bridge to the same revision and restart its
-background process (see section 8). The new scale requires
-`secondary_remaining_48h_bp` / `secondary_remaining_14d_bp`; an older bridge
-leaves it at `NO FORECAST`. Check the bridge log for successful packets with
-these fields. A forecast also requires sufficient fresh usage history.
+Update the bridge to the same revision and restart its background process
+(see section 8). The dashboard needs `quota_observed_at`, `quota_valid_until`,
+`quota_status`, signed `secondary_remaining_48h_bp` / `secondary_remaining_14d_bp`,
+and `secondary_forecast_status`. An older bridge cannot prove freshness and
+leaves the new dashboard at `NO DATA`. Confirm the running supervisor's script
+path before restarting; it may point at the repository or the installed plugin.
 
-On the device, check portrait and landscape layouts: `LEFT AT RESET (pp)` above
-the scale, current `7d` usage below it, and no forecast marks on the weekly bar.
+Check both orientations: negative forecast on the left, positive on the right;
+weekly **remaining** quota; `RESET IN` and `GIFT EXP`; no `LIVE` label. Landscape
+uses a full-width forecast below the unchanged-size pet. Portrait places current
+quota and countdowns below the pet, then the forecast at the bottom with its
+title above the axis.
+
 For controlled testing, use temporary quota packets through USB with the BLE
-bridge stopped: remainders `0`, `5000`, `-5000`, `5100`, and `-5100` exercise
-zero, exact endpoints, and outward arrows. Include a future weekly reset and
-forecast expiry. Omitting a remainder hides only that marker; expiry hides both.
+bridge stopped. Include `now`, `quota_status: "fresh"`, an original observation
+time, a future weekly reset, quota validity and forecast validity. Remainders
+`0`, `5000`, `-5000`, `5100`, and `-5100` exercise zero, exact endpoints, and
+outward arrows. Missing markers are omitted; an expired forecast cannot display
+as zero. Confirm that stopping updates preserves still-valid values with a
+warning, then hides them at expiry or reset. A connected bridge with no quota
+shows `NO DATA`; a disconnected display with no usable quota shows `NO LINK`.
 Restart the normal bridge afterwards to restore live quota data.
 
 ## 4. Upload GIF Assets

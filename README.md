@@ -4,7 +4,7 @@ Codex Buddy turns an M5Stack StickS3 into a desktop companion for Codex usage, l
 It pairs firmware with a local Codex bridge so the device can show usage bars, reset countdowns, and live work-state animations over BLE.
 
 The StickS3 shows Codex usage over BLE: a GIF pet, a weekly remainder forecast,
-a 7-day usage bar, a reset countdown, and live state changes such as `busy`, `idle`,
+a weekly remaining-quota bar, reset and gift-expiry countdowns, and live state changes such as `busy`, `idle`,
 `completed`, `attention`, `dizzy`, `heart`, and `sleep`.
 
 This project is a personal fork of Anthropic's
@@ -20,39 +20,50 @@ usage bridge.
 
 ## What It Displays
 
-- GIF pet area.
-- `CODEX USAGE` header with `LIVE` or `WAIT`.
-- `LEFT AT RESET (pp)`: predicted weekly quota remaining, in percentage points.
-- Weekly usage window labeled `7d`, with its reset countdown.
-- Color-coded usage bars:
-  - `0-34%`: blue
-  - `35-69%`: green
-  - `70-100%`: orange
-- Color-coded reset time values:
-  - `7d`: green above 4d, orange above 2d, red at 2d or below
-- Two optional triangles on the separate forecast scale:
-  - cyan, above the axis: recent pace, using up to 48 hours of history
-  - magenta, below the axis: longer-term pace, using up to 14 days of history
+- GIF pet area, preserving the landscape pet's 58% scale.
+- `WEEK LEFT`: remaining weekly quota (`100 - used`), with a neutral bar.
+- `LEFT AT RESET (pp)`: predicted weekly remainder, in percentage points.
+- `RESET IN`: time until the automatic weekly reset.
+- `GIFT EXP`: the soonest expiry among available Codex reset credits. `--` means
+  no known unexpired credit; this display never uses a credit automatically.
+- Countdown colors: green above 4 days, amber above 2 days, red otherwise.
+- Two forecast triangles: blue above the axis for recent pace (up to 48 hours),
+  violet below for longer history (up to 14 days).
 
-Portrait mode places the pet above the forecast and weekly bar. Landscape mode
-places the pet on the left and both indicators on the right.
+Landscape mode places the pet on the left, current quota and countdowns on the
+right, and the forecast across the full width underneath. Its title sits below
+the axis, with all five numeric labels above it. Portrait mode places the pet
+first, current quota and countdowns next, and the forecast at the bottom, with
+its title above the axis.
+
+A healthy dashboard has no connection status label. If quota updates fail or the
+link drops, valid cached values stay visible, dimmed, with `NO UPDATE` or `NO LINK`
+and their observation age. Quota and forecasts expire no later than 15 minutes
+after observation or the weekly reset, whichever comes first. Replayed packets,
+activity messages, and bridge restarts never extend that lifetime. Without
+usable quota, the dashboard replaces the metrics with `NO LINK` / `NO DATA`,
+the last observation age (or `--`), and a short instruction to check Bluetooth
+or Codex on the Mac. Link presence alone does not prove that quota is fresh.
 
 Both markers use projected usage at the next weekly reset: current usage plus the
 observed average consumption rate multiplied by time remaining. They use the
 available history after at least one hour of observations; there is no 14-day
 waiting period. The displayed remainder is `100 - projected usage`: positive
-on the left, negative on the right. The symmetric `log1p(abs(remainder))` scale
-is most sensitive near zero and extends from +50 to -50 pp. Small ticks mark
+on the right, negative on the left. The symmetric `log1p(abs(remainder))` scale
+is most sensitive near zero and extends from -50 to +50 pp. Small ticks mark
 1–5, 20, 30 and 40 on each side (7 pixels tall); the labelled +/-10 and +/-50
-ticks are 13 pixels tall, matching the white zero tick. Labels alternate above
-and below.
+ticks are 13 pixels tall, matching the white zero tick. In portrait, +/-10 labels
+sit below the axis to leave more space between labels; in landscape, all labels
+sit above it.
 
 The 5-by-10-pixel triangles point toward the axis. Beyond either limit they
 rotate outward and shift 5 pixels beyond the end tick, without extra numbers.
 Exactly +/-50 remains a vertical triangle. Separate upper/lower positions keep
 both forecasts visible even when they coincide. When neither forecast is valid,
 the panel shows `NO FORECAST`; missing data never appears as a zero remainder.
-The weekly usage bar has no forecast markers.
+The weekly remainder bar has no forecast markers. The -50 endpoint is muted red,
++50 is muted green, and zero is white. `COLLECTING HISTORY` is only shown during
+forecast warmup; other unavailable forecasts do not imply that waiting will fix them.
 
 The bridge keeps a bounded, atomically written `quota_history.json` in
 `${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge`, sampling fresh quota responses
@@ -64,6 +75,23 @@ calculating rates. Both scheduled and manual quota resets preserve the rolling
 history: only the interval straddling a reset is excluded from consumption and
 observed time. Forecasts immediately use the retained rate with the new quota
 and reset deadline; they do not restart the one-hour warmup.
+
+The next reset deadline and the consumption cycle are stored separately. After
+an early/global reset, the server can report an unused window whose deadline
+moves with each poll. Zero-usage observations remain in the same cycle, including
+its first usage anchoring the deadline; these metadata changes never bypass the
+five-minute sampling interval. An elapsed deadline or a changed deadline after
+positive usage separates cycles. The latter can indicate an unobserved reset,
+so its crossing interval is excluded even if the new percentage has caught up.
+A percentage drop without deadline evidence remains ambiguous and is rejected
+until consistent observations resume, rather than counting a transient dip twice.
+
+History format v2 adds an independent cycle identifier to each observation.
+Existing v1 history is validated, reclassified and compacted in memory, then
+upgraded atomically on the next accepted live observation. Migration preserves
+the observations still present; it cannot recreate records already evicted by
+an older bridge. The BLE forecast fields are unchanged, so this calculation
+update requires only restarting the Python bridge, with no firmware flash.
 
 History is scoped to the quota limit and a fingerprint of the account email
 and plan returned by `account/read`; routine credential refreshes preserve it.
@@ -78,8 +106,8 @@ Forecasts are approximate: quota percentages are rounded, unobserved reset
 boundaries have unknown consumption, and usage at the 100% ceiling does not
 measure additional demand. A same-cycle gap has a known total change, but gaps
 over six hours are not interpolated across a forecast window boundary. Markers
-are omitted if less than 80% of the available span is usable, if no fresh quota
-response is available, or if their validity time expires (at most 15 minutes,
+are omitted if less than 80% of the available span is usable or if their
+validity time expires (at most 15 minutes,
 and never beyond the quota reset). Missing/corrupt history does not interrupt
 the ordinary usage display. Collection follows the existing BLE bridge
 lifecycle, so an offline device can leave gaps in history.
@@ -315,6 +343,12 @@ The bridge sends compact JSON over BLE:
   "secondary": 16,
   "primary_resets_at": 1778673005,
   "secondary_resets_at": 1779159360,
+  "quota_status": "fresh",
+  "quota_observed_at": 1778671200,
+  "quota_valid_until": 1778672100,
+  "secondary_forecast_status": "learning",
+  "gift_reset_expires_at": 0,
+  "gift_observed_at": 1778671200,
   "now": 1778671200
 }
 ```
@@ -330,7 +364,13 @@ OpenAI does not report that window; the firmware renders it as unavailable.
 | `secondary` | Optional 7-day usage percentage |
 | `primary_resets_at` | Optional Unix timestamp for primary reset |
 | `secondary_resets_at` | Unix timestamp for secondary reset |
-| `now` | Sender timestamp |
+| `now` | Sender timestamp used to synchronize the device clock |
+| `quota_status` | `fresh`, `cached`, or `unavailable`; independent of link/activity |
+| `quota_observed_at` | Unix time of the actual quota observation; retained across replay/restart |
+| `quota_valid_until` | Quota expiry, capped at observation + 15 minutes and the weekly reset |
+| `gift_reset_expires_at` | Earliest available reset credit expiry; 0 confirms none; omitted means unknown |
+| `gift_observed_at` | Unix time when credit metadata was observed |
+| `secondary_forecast_status` | `ready`, `learning` (initial warmup), or `unavailable` |
 | `secondary_forecast_48h` | Legacy integer projected usage: 0–100, or 101 for overflow |
 | `secondary_forecast_14d` | Legacy integer projected usage: 0–100, or 101 for overflow |
 | `secondary_remaining_48h_bp` | Optional signed remainder in hundredths of a percentage point, -5100 to +5100 |
@@ -342,10 +382,10 @@ outside +/-50 pp are encoded as +/-5100 before rounding, preserving the
 distinction between a boundary and an overflow. Precision of transmission does
 not imply accuracy of the underlying estimate.
 
-Old firmware ignores the added remainder fields and keeps using the legacy
-forecasts. New firmware clears missing remainder fields on every quota packet.
-With an old bridge it shows `NO FORECAST`, since legacy overflow has lost its
-magnitude. Updating this feature requires both the bridge and firmware, without
+Old firmware ignores the added freshness/credit fields and keeps using the legacy
+forecasts. New firmware clears missing fields on every quota packet. With an old
+bridge it shows `NO DATA`: freshness cannot be inferred safely from repeated
+quota values or activity timestamps. Updating this feature requires both the bridge and firmware, without
 uploading the pet filesystem. The five-hour fields remain in the protocol and
 diagnostic pages, but are no longer displayed on the home dashboard.
 
@@ -356,11 +396,11 @@ pio run -e m5stack-sticks3
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s plugins/codex-usage-stick/tests -v
 ```
 
-The firmware tests compile the production JSON parser and drawing functions
-with host hardware stubs and the PlatformIO-provided ArduinoJson headers. They
-check field validation, expiry, backwards compatibility, scale monotonicity,
-marker direction and pixel bounds in both orientations, tick heights, and the
-unmarked weekly bar. These checks require a C++ compiler;
+The firmware tests compile the production snapshot parser, state model, and
+renderer directly, using a recording graphics surface and PlatformIO ArduinoJson
+headers. They check field validation, expiry, cached/offline states, scale
+monotonicity, marker direction, text/pixel bounds in both orientations, tick
+heights, and the unmarked weekly remainder bar. These checks require a C++ compiler;
 otherwise the host firmware checks are reported as skipped.
 
 ## GIF Character Pack Format

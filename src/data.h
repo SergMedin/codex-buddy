@@ -3,9 +3,7 @@
 #include <ArduinoJson.h>
 #include "ble_bridge.h"
 #include "xfer.h"
-
-// Signed hundredths of a percentage point; +/-5100 means outside +/-50 pp.
-constexpr int16_t FORECAST_UNAVAILABLE = 32767;
+#include "usage_packet.h"
 
 struct TamaState {
   uint8_t  sessionsTotal;
@@ -15,14 +13,10 @@ struct TamaState {
   uint32_t tokensToday;
   uint32_t codexTokens;
   uint8_t  codexPrimary;
-  uint8_t  codexSecondary;
   bool     codexPrimaryAvailable;
-  bool     codexSecondaryAvailable;
   uint32_t codexPrimaryResetsAt;
-  uint32_t codexSecondaryResetsAt;
-  int16_t  codexRemaining48h = FORECAST_UNAVAILABLE;
-  int16_t  codexRemaining14d = FORECAST_UNAVAILABLE;
-  uint32_t codexForecastValidUntil = 0;
+  usage::Snapshot quota;
+  uint32_t quotaRevision = 0;
   char     codexState[16];
   uint32_t lastUpdated;
   char     msg[24];
@@ -38,8 +32,8 @@ struct TamaState {
 // ---------------------------------------------------------------------------
 // Three modes, checked in priority order:
 //   demo   → auto-cycle fake scenarios every 8s, ignore live data
-//   live   → JSON arrived in the last 10s over USB or BT
-//   asleep → no data, all zeros, "No Codex bridge"
+//   live   → JSON arrived in the last 30s over USB or BT
+//   asleep → no recent traffic; cached quota expires independently
 // ---------------------------------------------------------------------------
 
 static uint32_t _lastLiveMs = 0;
@@ -105,19 +99,6 @@ static uint8_t _jsonPct(JsonVariant v, uint8_t fallback) {
   return (uint8_t)n;
 }
 
-static int16_t _jsonRemaining(JsonVariant v) {
-  if (!v.is<int>()) return FORECAST_UNAVAILABLE;
-  int n = v.as<int>();
-  return n >= -5100 && n <= 5100 ? (int16_t)n : FORECAST_UNAVAILABLE;
-}
-
-inline bool dataForecastActive(const TamaState& state) {
-  uint32_t now = 0;
-  return !dataDemo() && state.connected && state.codexSecondaryAvailable
-      && dataUtcNow(&now) && now < state.codexSecondaryResetsAt
-      && now < state.codexForecastValidUntil;
-}
-
 static void _applyPrompt(JsonVariant v, TamaState* out, bool clearIfNull) {
   JsonObject pr = v.as<JsonObject>();
   if (!pr.isNull()) {
@@ -151,6 +132,7 @@ static void _applyJson(const char* line, TamaState* out) {
   if (doc["now"].is<uint32_t>()) dataSyncUtc(doc["now"].as<uint32_t>());
 
   bool codexPacket = doc["state"].is<const char*>()
+                  || doc["quota_status"].is<const char*>()
                   || doc["primary"].is<int>()
                   || doc["secondary"].is<int>()
                   || doc["primary_resets_at"].is<uint32_t>()
@@ -158,9 +140,12 @@ static void _applyJson(const char* line, TamaState* out) {
 
   if (codexPacket) {
     const char* st = doc["state"];
-    if (!st || !*st) st = out->codexState[0] ? out->codexState : "idle";
-    strncpy(out->codexState, st, sizeof(out->codexState) - 1);
-    out->codexState[sizeof(out->codexState) - 1] = 0;
+    if (st && *st) {
+      strncpy(out->codexState, st, sizeof(out->codexState) - 1);
+      out->codexState[sizeof(out->codexState) - 1] = 0;
+    } else if (!out->codexState[0]) {
+      strcpy(out->codexState, "idle");
+    }
 
     if (doc["tokens"].is<uint32_t>()) {
       out->codexTokens = doc["tokens"].as<uint32_t>();
@@ -171,24 +156,13 @@ static void _applyJson(const char* line, TamaState* out) {
     bool hasPrimary = doc["primary"].is<int>()
                    && doc["primary_resets_at"].is<uint32_t>()
                    && doc["primary_resets_at"].as<uint32_t>() > 0;
-    bool hasSecondary = doc["secondary"].is<int>()
-                     && doc["secondary_resets_at"].is<uint32_t>()
-                     && doc["secondary_resets_at"].as<uint32_t>() > 0;
     out->codexPrimaryAvailable = hasPrimary;
-    out->codexSecondaryAvailable = hasSecondary;
     if (hasPrimary) {
       out->codexPrimary = _jsonPct(doc["primary"], out->codexPrimary);
       out->codexPrimaryResetsAt = doc["primary_resets_at"].as<uint32_t>();
     }
-    if (hasSecondary) {
-      out->codexSecondary = _jsonPct(doc["secondary"], out->codexSecondary);
-      out->codexSecondaryResetsAt = doc["secondary_resets_at"].as<uint32_t>();
-    }
-    // Legacy overflow (101) has lost its magnitude: never infer a remainder from it.
-    out->codexRemaining48h = hasSecondary ? _jsonRemaining(doc["secondary_remaining_48h_bp"]) : FORECAST_UNAVAILABLE;
-    out->codexRemaining14d = hasSecondary ? _jsonRemaining(doc["secondary_remaining_14d_bp"]) : FORECAST_UNAVAILABLE;
-    out->codexForecastValidUntil = hasSecondary && doc["secondary_forecast_valid_until"].is<uint32_t>()
-                                ? doc["secondary_forecast_valid_until"].as<uint32_t>() : 0;
+    out->quota = usage::parseSnapshot(doc.as<JsonVariantConst>());
+    ++out->quotaRevision;
 
     out->sessionsRunning = strcmp(out->codexState, "busy") == 0 ? 1 : 0;
     out->sessionsWaiting = strcmp(out->codexState, "attention") == 0 ? 1 : 0;
@@ -261,13 +235,18 @@ inline void dataPoll(TamaState* out) {
     const _Fake& s = _FAKES[_demoIdx];
     out->sessionsTotal=s.t; out->sessionsRunning=s.r; out->sessionsWaiting=s.w;
     out->recentlyCompleted=s.c; out->tokensToday=s.tok; out->lastUpdated=now;
-    out->codexTokens=s.tok; out->codexPrimary=s.p; out->codexSecondary=s.s;
-    out->codexPrimaryAvailable=true; out->codexSecondaryAvailable=true;
+    out->codexTokens=s.tok; out->codexPrimary=s.p; out->quota.used=s.s;
+    out->codexPrimaryAvailable=true; out->quota.available=true;
     if (_utcEpochAtSync == 0) dataSyncUtc(now / 1000);
     uint32_t utcNow = 0;
     if (dataUtcNow(&utcNow)) {
       out->codexPrimaryResetsAt = utcNow + 4 * 3600 + 32 * 60;
-      out->codexSecondaryResetsAt = utcNow + 5 * 86400 + 12 * 3600;
+      out->quota.resetsAt = utcNow + 5 * 86400 + 12 * 3600;
+      out->quota.observedAt = utcNow;
+      out->quota.validUntil = utcNow + usage::CACHE_SECONDS;
+      out->quota.source = usage::Source::Fresh;
+      out->quota.forecast = usage::Forecast::Unavailable;
+      out->quota.giftKnown = false;
     }
     strncpy(out->codexState, s.st, sizeof(out->codexState) - 1);
     out->codexState[sizeof(out->codexState) - 1] = 0;

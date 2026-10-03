@@ -6,9 +6,10 @@
 static void appRtcSynced(time_t localEpoch);
 #include "data.h"
 #include "buddy.h"
+#include "usage_display.h"
 
 M5Canvas spr(&M5.Lcd);
-M5Canvas usagePetSpr(&M5.Lcd);
+M5Canvas usageCanvas(&M5.Lcd);
 
 // Advertise as "Codex-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop bridge. Name persists in
@@ -28,7 +29,6 @@ const int CX = W / 2;
 const int CY_BASE = 120;
 const int USAGE_PET_TOP = 26;
 const int USAGE_PET_H = 94; // Leave the forecast title clear of the pet canvas.
-const int USAGE_PET_BOTTOM = USAGE_PET_TOP + USAGE_PET_H;
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 const int LED_PIN = -1;          // no user LED on StickS3
 #else
@@ -72,8 +72,6 @@ uint8_t msgScroll = 0;
 uint16_t lastLineGen = 0;
 char     lastPromptId[40] = "";
 bool     usageFullPushNeeded = true;
-bool     usageLiveKnown = false;
-bool     usageLastLive = false;
 uint32_t lastInteractMs = 0;
 bool     dimmed = false;
 bool     screenOff = false;
@@ -106,8 +104,6 @@ const uint32_t SCREEN_OFF_MS = 30000;
 bool     napping = false;
 uint32_t napStartMs = 0;
 uint32_t promptArrivedMs = 0;
-const uint32_t HOUR_SEC = 3600;
-const uint32_t DAY_SEC = 86400;
 
 // Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
 static bool isFaceDown() {
@@ -147,7 +143,6 @@ const uint8_t INFO_PG_CREDITS = 5;
 void applyDisplayMode() {
   bool peek = displayMode != DISP_NORMAL;
   usageFullPushNeeded = true;
-  usageLiveKnown = false;
   characterSetPeekWindow(0, 70);
   characterSetPeekBottomAlign(false);
   characterSetPeek(peek);
@@ -719,16 +714,16 @@ void drawInfo() {
     ln("usage over BLE.");
     y += 6;
     ln("The home screen shows");
-    ln("weekly usage and quota");
+    ln("weekly remainder and");
     ln("left at reset (pp).");
     y += 6;
     spr.setTextColor(p.text, p.bg);
     ln("Cyan: recent pace.");
-    ln("Pink: longer history.");
+    ln("Violet: long history.");
     y += 6;
     spr.setTextColor(p.textDim, p.bg);
-    ln("Left: quota to spare.");
-    ln("Right: over budget.");
+    ln("Left: over budget.");
+    ln("Right: quota to spare.");
 
   } else if (infoPage == 1) {
     _infoHeader(p, y, "BUTTONS", infoPage);
@@ -750,7 +745,7 @@ void drawInfo() {
     ln("  tokens    %lu", (unsigned long)tama.codexTokens);
     if (tama.codexPrimaryAvailable) ln("  primary   %u%%", tama.codexPrimary);
     else                            ln("  primary   --");
-    if (tama.codexSecondaryAvailable) ln("  secondary %u%%", tama.codexSecondary);
+    if (tama.quota.available) ln("  secondary %u%%", tama.quota.used);
     else                              ln("  secondary --");
     y += 8;
     spr.setTextColor(p.text, p.bg);
@@ -1064,218 +1059,14 @@ void drawPet() {
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
 }
 
-static uint16_t usageColor(uint8_t pct, const Palette& p) {
-  if (pct >= 70) return HOT;
-  if (pct >= 35) return GREEN;
-  return 0x04DF;
-}
-
-static uint16_t resetColor(uint32_t resetAt, const char* windowLabel, bool live, const Palette& p) {
+static usage::View dashboardView() {
   uint32_t now = 0;
-  if (!live || resetAt == 0 || !dataUtcNow(&now)) return p.textDim;
-
-  uint32_t left = resetAt > now ? resetAt - now : 0;
-  if (left == 0) return HOT;
-
-  if (strcmp(windowLabel, "7d") == 0) {
-    if (left > 4 * DAY_SEC) return GREEN;
-    if (left > 2 * DAY_SEC) return 0xFD20;
-    return HOT;
-  }
-
-  if (left > 3 * HOUR_SEC) return GREEN;
-  if (left > HOUR_SEC) return 0xFD20;
-  return HOT;
-}
-
-static void resetText(uint32_t resetAt, char* out, size_t len) {
-  uint32_t now = 0;
-  if (resetAt == 0 || !dataUtcNow(&now)) {
-    snprintf(out, len, "resets --");
-    return;
-  }
-
-  uint32_t left = resetAt > now ? resetAt - now : 0;
-  if (left == 0) {
-    snprintf(out, len, "reset soon");
-    return;
-  }
-  if (left >= 86400) {
-    snprintf(out, len, "resets in %lud %02luh",
-             (unsigned long)(left / 86400),
-             (unsigned long)((left / 3600) % 24));
-  } else if (left >= 3600) {
-    snprintf(out, len, "resets in %luh %02lum",
-             (unsigned long)(left / 3600),
-             (unsigned long)((left / 60) % 60));
-  } else {
-    snprintf(out, len, "resets in %lum", (unsigned long)(left / 60));
-  }
-}
-
-static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
-  uint32_t now = 0;
-  if (resetAt == 0 || !dataUtcNow(&now)) {
-    out[0] = 0;
-    return;
-  }
-
-  uint32_t left = resetAt > now ? resetAt - now : 0;
-  if (left == 0) {
-    out[0] = 0;
-    return;
-  }
-  if (left >= 86400) {
-    snprintf(out, len, "%lud %02luh",
-             (unsigned long)(left / 86400),
-             (unsigned long)((left / 3600) % 24));
-  } else if (left >= 3600) {
-    snprintf(out, len, "%luh %02lum",
-             (unsigned long)(left / 3600),
-             (unsigned long)((left / 60) % 60));
-  } else {
-    snprintf(out, len, "%lum", (unsigned long)(left / 60));
-  }
-}
-
-// Symmetric log1p scale: positive remainder on the left, deficit on the right.
-// Input is hundredths of a percentage point, not the rounded legacy forecast.
-static int forecastPosition(int x, int w, int remainingBp) {
-  const int left = x + 3, right = x + w - 4;
-  const float center = (left + right) / 2.0f;
-  const int magnitude = abs(remainingBp) > 5000 ? 5000 : abs(remainingBp);
-  const float offset = log1pf(magnitude / 100.0f) / log1pf(50.0f) * (right - left) / 2.0f;
-  return lroundf(center + (remainingBp < 0 ? offset : -offset));
-}
-
-static void drawForecastMarker(lgfx::v1::LGFXBase* dst, int x, int axis, int w,
-                               int remainingBp, bool upper) {
-  if (remainingBp < -5100 || remainingBp > 5100) return;
-  const int px = forecastPosition(x, w, remainingBp);
-  const uint16_t color = upper ? 0x07FF : 0xF81F;
-  if (abs(remainingBp) > 5000) {
-    // Rotate the 5x10 triangle outward and move it half its length beyond
-    // the end tick. Uses two pixels outside the panel, within screen margins.
-    const int inward = remainingBp > 0 ? 1 : -1;
-    const int cy = axis + (upper ? -7 : 7);
-    for (int column = 0; column < 10; ++column) {
-      const int radius = (2 * column + 4) / 9;
-      dst->fillRect(px + inward * (column - 5), cy - radius, 1, 2 * radius + 1, color);
-    }
-  } else {
-    for (int row = 0; row < 10; ++row) {
-      const int radius = (2 * row + 4) / 9;
-      dst->fillRect(px - radius, axis + (upper ? -2 - row : 2 + row),
-                    2 * radius + 1, 1, color);
-    }
-  }
-}
-
-static void drawForecastScaleOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
-                                int remaining48h, int remaining14d, const Palette& p) {
-  dst->setTextSize(1);
-  dst->setTextDatum(TC_DATUM);
-  dst->setTextColor(p.text, p.bg);
-  dst->drawString("LEFT AT RESET (pp)", x + w / 2, y);
-  const int axis = y + 32;
-  if (remaining48h == FORECAST_UNAVAILABLE && remaining14d == FORECAST_UNAVAILABLE) {
-    dst->setTextColor(p.textDim, p.bg);
-    dst->drawString("NO FORECAST", x + w / 2, axis - 3);
-    dst->setTextDatum(TL_DATUM);
-    return;
-  }
-  dst->drawLine(x + 3, axis, x + w - 4, axis, p.textDim);
-  const int ticks[] = {50,40,30,20,10,5,4,3,2,1,0,-1,-2,-3,-4,-5,-10,-20,-30,-40,-50};
-  for (int value : ticks) {
-    const int px = forecastPosition(x, w, value * 100);
-    const int height = (value == 0 || abs(value) == 10 || abs(value) == 50) ? 13 : 7;
-    dst->fillRect(px, axis - height / 2, 1, height, value == 0 ? 0xFFFF : p.textDim);
-  }
-  dst->setTextColor(p.textDim, p.bg);
-  dst->setTextDatum(TL_DATUM);
-  dst->drawString("+50", x, y + 14);
-  dst->setTextDatum(TR_DATUM);
-  dst->drawString("-50", x + w, y + 14);
-  dst->setTextDatum(TC_DATUM);
-  dst->drawString("+10", forecastPosition(x, w, 1000), axis + 13);
-  dst->drawString("-10", forecastPosition(x, w, -1000), axis + 13);
-  dst->setTextColor(0xFFFF, p.bg);
-  dst->drawString("0", forecastPosition(x, w, 0), y + 14);
-  drawForecastMarker(dst, x, axis, w, remaining48h, true);
-  drawForecastMarker(dst, x, axis, w, remaining14d, false);
-  dst->setTextDatum(TL_DATUM);
-}
-
-static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
-                             uint8_t pct, const char* windowLabel,
-                             uint32_t resetAt, bool live, bool available,
-                             const Palette& p) {
-  if (pct > 100) pct = 100;
-  bool active = live && available;
-  uint16_t fill = active ? usageColor(pct, p) : p.textDim;
-  char left[8];
-  if (active) snprintf(left, sizeof(left), "%u%%", pct);
-  else strncpy(left, "--", sizeof(left));
-
-  dst->setTextSize(2);
-  dst->setTextDatum(TL_DATUM);
-  dst->setTextColor(active ? p.text : p.textDim, p.bg);
-  dst->drawString(left, x, y);
-  dst->setTextDatum(TR_DATUM);
-  dst->drawString(windowLabel, x + w, y);
-
-  const int bx = x, by = y + 24, bw = w, bh = 13;
-  dst->drawRect(bx, by, bw, bh, p.textDim);
-  dst->fillRect(bx + 1, by + 1, bw - 2, bh - 2, p.bg);
-  int fw = (int)((uint32_t)(bw - 2) * pct / 100);
-  if (active && fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
-
-  dst->setTextSize(1);
-  dst->setTextDatum(TL_DATUM);
-  if (active && resetAt != 0) {
-    uint32_t now = 0;
-    char rt[12];
-    resetTimeText(resetAt, rt, sizeof(rt));
-    if (dataUtcNow(&now) && resetAt > now && rt[0]) {
-      const char* prefix = "resets in ";
-      dst->setTextColor(p.textDim, p.bg);
-      dst->drawString(prefix, x, y + 44);
-      int prefixW = dst->textWidth(prefix);
-      dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
-      dst->drawString(rt, x + prefixW, y + 44);
-    } else {
-      dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
-      dst->drawString("reset soon", x, y + 44);
-    }
-  } else if (live && !available) {
-    dst->setTextColor(p.textDim, p.bg);
-    dst->drawString("not reported", x, y + 44);
-  } else {
-    dst->setTextColor(p.textDim, p.bg);
-    dst->drawString("resets --", x, y + 44);
-  }
-}
-
-static void drawUsageMeter(int y, uint8_t pct, const char* windowLabel,
-                           uint32_t resetAt, bool live, bool available,
-                           const Palette& p) {
-  drawUsageMeterOn(&spr, 8, y, W - 16, pct, windowLabel, resetAt,
-                   live, available, p);
+  dataUtcNow(&now);
+  return usage::derive(tama.quota, now, dataDemo() || dataConnected() || bleConnected());
 }
 
 static void drawUsageDashboard() {
   const Palette& p = characterPalette();
-  bool live = tama.connected;
-  uint8_t secondary = live ? tama.codexSecondary : 0;
-
-  if (!usageLiveKnown || usageLastLive != live) {
-    usageLiveKnown = true;
-    usageLastLive = live;
-    usageFullPushNeeded = true;
-  }
-
-  spr.fillRect(0, USAGE_PET_BOTTOM, W, H - USAGE_PET_BOTTOM, p.bg);
-
   if (characterLoaded()) {
     characterSetPeekWindow(USAGE_PET_TOP, USAGE_PET_H);
     characterSetPeekBottomAlign(false);
@@ -1287,132 +1078,74 @@ static void drawUsageDashboard() {
     buddySetPeek(true);
     buddyRenderTo(&spr, activeState);
   }
-
   if (usageFullPushNeeded) {
     spr.fillRect(0, 0, W, USAGE_PET_TOP, p.bg);
     spr.setTextSize(1);
     spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(p.textDim, p.bg);
+    spr.setTextColor(usage::MUTED, p.bg);
     spr.drawString("CODEX USAGE", 8, 8);
-    spr.setTextDatum(TR_DATUM);
-    spr.setTextColor(live ? GREEN : HOT, p.bg);
-    spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
   }
-
-  const bool forecastActive = dataForecastActive(tama);
-  drawForecastScaleOn(&spr, 8, 123, W - 16,
-                       forecastActive ? tama.codexRemaining48h : FORECAST_UNAVAILABLE,
-                       forecastActive ? tama.codexRemaining14d : FORECAST_UNAVAILABLE, p);
-  drawUsageMeter(184, secondary, "7d", live ? tama.codexSecondaryResetsAt : 0,
-                 live, tama.codexSecondaryAvailable, p);
-
-  spr.setTextDatum(TL_DATUM);
+  usage::Display<M5Canvas>(spr, p.bg).portrait(dashboardView());
 }
 
 static void drawUsageDashboardLandscape() {
   const Palette& p = characterPalette();
-  bool live = tama.connected;
-  uint8_t secondary = live ? tama.codexSecondary : 0;
-  uint32_t secondaryReset = live ? tama.codexSecondaryResetsAt : 0;
-  bool secondaryAvailable = tama.codexSecondaryAvailable;
-  const bool forecastActive = dataForecastActive(tama);
-  int remaining48h = forecastActive ? tama.codexRemaining48h : FORECAST_UNAVAILABLE;
-  int remaining14d = forecastActive ? tama.codexRemaining14d : FORECAST_UNAVAILABLE;
-
-  if (!usageLiveKnown || usageLastLive != live) {
-    usageLiveKnown = true;
-    usageLastLive = live;
-    usageFullPushNeeded = true;
-  }
-
+  const usage::View view = dashboardView();
   M5.Lcd.setRotation(clockOrient);
-  const int lw = M5.Lcd.width();
-  const int lh = M5.Lcd.height();
-  const int leftW = 104;
-  const int rightX = leftW + 8;
-  const int rightW = lw - rightX - 8;
-
-  bool repaint = paintedOrient != clockOrient || usageFullPushNeeded;
-  if (repaint) {
-    M5.Lcd.fillScreen(p.bg);
-    paintedOrient = clockOrient;
+  const bool repaint = paintedOrient != clockOrient || usageFullPushNeeded;
+  const bool canvasMissing = usageCanvas.width() != 240 || usageCanvas.height() != 135;
+  if (canvasMissing) {
+    usageCanvas.deleteSprite();
+    usageCanvas.setColorDepth(16);
+    usageCanvas.createSprite(240, 135);
   }
+  const bool buffered = usageCanvas.width() == 240 && usageCanvas.height() == 135;
+  lgfx::v1::LGFXBase* target = buffered ? static_cast<lgfx::v1::LGFXBase*>(&usageCanvas) : &M5.Lcd;
+  // A 180-degree turn only changes the destination orientation. Retain the
+  // pet's last frame, including during the pause between GIF cycles.
+  const bool resetCanvas = usageFullPushNeeded || canvasMissing;
+  if (resetCanvas) target->fillScreen(p.bg);
+  if (repaint && !buffered) characterInvalidate();
 
-  static bool cachedLive = false;
-  static uint8_t cachedSecondary = 0xFF;
-  static uint32_t cachedSecondaryReset = 0xFFFFFFFF;
-  static bool cachedSecondaryAvailable = false;
-  static int cachedRemaining48h = FORECAST_UNAVAILABLE;
-  static int cachedRemaining14d = FORECAST_UNAVAILABLE;
-  static uint8_t cachedOrient = 0;
-  static uint8_t cachedPetState = 0xFF;
-  static int cachedPetW = 0;
-  static int cachedPetH = 0;
-  bool panelChanged = repaint
-                   || cachedOrient != clockOrient
-                   || cachedLive != live
-                   || cachedSecondary != secondary
-                   || cachedSecondaryReset != secondaryReset
-                   || cachedSecondaryAvailable != secondaryAvailable
-                   || cachedRemaining48h != remaining48h
-                   || cachedRemaining14d != remaining14d;
-
+  // Re-evaluate clock-driven states even when the bridge sends no new packet.
+  static uint32_t lastPanelMs = 0, lastQuotaRevision = 0;
+  static bool lastLinked = false;
+  static uint8_t lastPetState = 0xFF;
+  const uint32_t nowMs = millis();
+  const bool panelChanged = repaint || canvasMissing || nowMs - lastPanelMs >= 1000
+      || lastQuotaRevision != tama.quotaRevision || lastLinked != view.linked;
   if (panelChanged) {
-    M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextColor(p.textDim, p.bg);
-    M5.Lcd.drawString("CODEX USAGE", rightX, 7);
-    M5.Lcd.setTextDatum(TR_DATUM);
-    M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
-    M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 7);
-
-    drawForecastScaleOn(&M5.Lcd, rightX, 27, rightW, remaining48h, remaining14d, p);
-    drawUsageMeterOn(&M5.Lcd, rightX, 81, rightW, secondary, "7d",
-                     secondaryReset, live, secondaryAvailable, p);
-
-    cachedLive = live;
-    cachedSecondary = secondary;
-    cachedSecondaryReset = secondaryReset;
-    cachedSecondaryAvailable = secondaryAvailable;
-    cachedRemaining48h = remaining48h;
-    cachedRemaining14d = remaining14d;
-    cachedOrient = clockOrient;
+    usage::Display<lgfx::v1::LGFXBase>(*target, p.bg).landscape(view);
+    lastPanelMs = nowMs;
+    lastQuotaRevision = tama.quotaRevision;
+    lastLinked = view.linked;
   }
-
+  const bool stateChanged = lastPetState != activeState;
+  if (resetCanvas || stateChanged)
+    target->fillRect(0, 0, usage::LANDSCAPE_PET_WIDTH, usage::LANDSCAPE_PET_HEIGHT, p.bg);
+  bool frameDrawn = false;
   if (characterLoaded()) {
-    bool canvasChanged = false;
-    if (cachedPetW != leftW || cachedPetH != lh) {
-      usagePetSpr.deleteSprite();
-      usagePetSpr.setColorDepth(16);
-      usagePetSpr.createSprite(leftW, lh);
-      cachedPetW = usagePetSpr.width();
-      cachedPetH = usagePetSpr.height();
-      canvasChanged = true;
-    }
-
-    bool stateChanged = cachedPetState != activeState;
-    if (canvasChanged || stateChanged) usagePetSpr.fillSprite(p.bg);
-
     characterSetState(activeState);
-    bool frameDrawn = false;
-    if (cachedPetW == leftW && cachedPetH == lh) {
-      frameDrawn = characterRenderTo(&usagePetSpr, leftW / 2, lh / 2 + 4,
-                                     58, 0, 0, leftW, lh);
-      if (repaint || canvasChanged || stateChanged || frameDrawn) {
-        usagePetSpr.pushSprite(0, 0);
-      }
-    } else {
-      characterRenderTo(&M5.Lcd, leftW / 2, lh / 2 + 4, 58, 0, 0, leftW, lh);
-    }
-    cachedPetState = activeState;
+    frameDrawn = characterRenderTo(target, 52, 47, 58,
+        0, 0, usage::LANDSCAPE_PET_WIDTH, usage::LANDSCAPE_PET_HEIGHT);
   } else {
-    cachedPetState = 0xFF;
-    M5.Lcd.fillRect(0, 0, leftW, lh, p.bg);
+    target->setClipRect(0, 0, usage::LANDSCAPE_PET_WIDTH, usage::LANDSCAPE_PET_HEIGHT);
+    target->fillRect(0, 0, usage::LANDSCAPE_PET_WIDTH, usage::LANDSCAPE_PET_HEIGHT, p.bg);
     buddySetPeek(true);
-    buddyRenderTo(&M5.Lcd, activeState);
+    buddyRenderTo(target, activeState);
+    target->clearClipRect();
+    frameDrawn = true;
   }
-
+  if (buffered && (panelChanged || stateChanged || frameDrawn)) {
+    // The animation cannot erase the forecast. Only changed pet frames use
+    // the small transfer region; metric refreshes are presented atomically.
+    if (!panelChanged) M5.Lcd.setClipRect(0, 0, usage::LANDSCAPE_PET_WIDTH, usage::LANDSCAPE_PET_HEIGHT);
+    usageCanvas.pushSprite(0, 0);
+    M5.Lcd.clearClipRect();
+  }
+  lastPetState = activeState;
+  paintedOrient = clockOrient;
+  M5.Lcd.setTextSize(1);
   M5.Lcd.setTextDatum(TL_DATUM);
   M5.Lcd.setRotation(0);
   usageFullPushNeeded = false;

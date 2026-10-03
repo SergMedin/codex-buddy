@@ -32,6 +32,7 @@ def snapshot(
         event_ts=time.time() if event_ts is None else event_ts,
         limit_id="codex",
         limit_name=None,
+        quota_observed_at=time.time(),
     )
 
 
@@ -134,24 +135,6 @@ class RateLimitWindowTest(unittest.TestCase):
         self.assertIsNone(
             bridge.app_server_usage_snapshot_from_result(result, "codex", None)
         )
-
-    def test_new_weekly_snapshot_clears_stale_primary_window(self):
-        old = snapshot(
-            primary=27,
-            secondary=19,
-            primary_reset=FUTURE_RESET,
-            secondary_reset=FUTURE_RESET,
-            event_ts=1,
-        )
-        latest = snapshot(secondary=6, event_ts=2)
-        merged = bridge.merge_latest_rate_limits(old, latest)
-        self.assertEqual((merged.primary, merged.secondary), (0, 6))
-        self.assertEqual(
-            (merged.primary_resets_at, merged.secondary_resets_at),
-            (0, FUTURE_RESET),
-        )
-        self.assertNotIn("primary", merged.packet("idle"))
-
 
 if __name__ == "__main__":
     unittest.main()
