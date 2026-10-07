@@ -62,15 +62,19 @@ After flashing, the device should advertise as:
 Codex-XXXX
 ```
 
-### Updating only the forecast display
+### Updating forecasts and the dashboard display
 
-For the Python forecast calculation fix (early resets and moving unused-window
-deadlines), update and restart the running bridge as described in section 8.
-It automatically migrates retained history to format v2. The BLE packet schema
-is unchanged; an existing dashboard firmware does not need to be flashed.
+For the Python forecast calculation fix (early resets, delayed old-window
+responses, and full 14-day retention), update and restart the running bridge as
+described in section 8. It automatically migrates retained history to format v3.
+The BLE packet schema is unchanged; an existing dashboard firmware does not
+need to be flashed.
 Migration cannot restore observations already evicted from an older history.
+A partial history grows toward 14 days as observations arrive; the missing
+portion is never filled with guessed consumption.
 
-For an existing Codex Buddy, build and upload **firmware only**:
+To update the dashboard layout itself on an existing Codex Buddy, build and
+upload **firmware only**:
 
 ```bash
 pio device list

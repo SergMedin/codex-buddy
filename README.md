@@ -65,9 +65,12 @@ The weekly remainder bar has no forecast markers. The -50 endpoint is muted red,
 +50 is muted green, and zero is white. `COLLECTING HISTORY` is only shown during
 forecast warmup; other unavailable forecasts do not imply that waiting will fix them.
 
-The bridge keeps a bounded, atomically written `quota_history.json` in
-`${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge`, sampling fresh quota responses
-at five-minute intervals. On startup, it can seed missing history from the
+The bridge keeps an atomically written `quota_history.json` in
+`${CODEX_HOME:-$HOME/.codex}/codex-usage-bridge`. Fresh observations contribute
+measured consumption and covered time to five-minute buckets. Retention is
+14 days by observation time, independent of how many quota resets occur;
+reset events cannot evict recent history from a fixed-size observation ring.
+On startup, it can seed missing history from the
 rollout records it already reads, but only for the current, live-confirmed
 weekly cycle and matching limit. Older cycles are not imported. Duplicate
 records, percentage decreases, and reset timestamp rounding are handled before
@@ -76,22 +79,30 @@ history: only the interval straddling a reset is excluded from consumption and
 observed time. Forecasts immediately use the retained rate with the new quota
 and reset deadline; they do not restart the one-hour warmup.
 
-The next reset deadline and the consumption cycle are stored separately. After
-an early/global reset, the server can report an unused window whose deadline
-moves with each poll. Zero-usage observations remain in the same cycle, including
-its first usage anchoring the deadline; these metadata changes never bypass the
-five-minute sampling interval. An elapsed deadline or a changed deadline after
-positive usage separates cycles. The latter can indicate an unobserved reset,
-so its crossing interval is excluded even if the new percentage has caught up.
-A percentage drop without deadline evidence remains ambiguous and is rejected
-until consistent observations resume, rather than counting a transient dip twice.
+The reconciler remembers the highest observed counter for each known quota
+window. Returning to an older window starts a new continuity segment without
+counting its previous consumption again. This handles both delayed old replies
+after a real reset and an isolated false zero followed by the original window.
+The interval crossing a window switch has unknown consumption and is excluded.
+An unused window can move its deadline until first use; deadline movement alone
+does not manufacture consumption. A counter below its window's remembered
+high-water mark remains ambiguous and cannot train the forecast. Responses
+matching multiple windows within timestamp rounding tolerance are also
+excluded until the window can be identified unambiguously.
 
-History format v2 adds an independent cycle identifier to each observation.
-Existing v1 history is validated, reclassified and compacted in memory, then
-upgraded atomically on the next accepted live observation. Migration preserves
-the observations still present; it cannot recreate records already evicted by
-an older bridge. The BLE forecast fields are unchanged, so this calculation
-update requires only restarting the Python bridge, with no firmware flash.
+History format v3 separates window reconciliation from the rolling consumption
+ledger. Existing v1/v2 observations are validated and replayed through the same
+reconciler before migration, repairing repeated old-window counters that remain
+in those observations. The upgrade is written atomically after an accepted live
+observation. Migration cannot recreate records already lost by an older bridge.
+The BLE forecast fields are unchanged; this update requires restarting the
+Python bridge and no firmware flash.
+
+Fourteen days is the retention window, not invented coverage: a new installation
+or a recovered partial history initially has fewer days available. The long
+forecast uses that available span, subject to the same coverage checks. Account
+changes, missing observations, and discarded corrupt data cannot be replaced
+with assumed zero usage or another account's unscoped logs.
 
 History is scoped to the quota limit and a fingerprint of the account email
 and plan returned by `account/read`; routine credential refreshes preserve it.
@@ -105,7 +116,11 @@ history keys are migrated only when they still match that file.
 Forecasts are approximate: quota percentages are rounded, unobserved reset
 boundaries have unknown consumption, and usage at the 100% ceiling does not
 measure additional demand. A same-cycle gap has a known total change, but gaps
-over six hours are not interpolated across a forecast window boundary. Markers
+over six hours are retained as whole intervals and are not interpolated across
+a forecast window boundary. Short intervals are aggregated in five-minute
+buckets; continuous boundary buckets use proportional coverage at that
+resolution. Partially queried buckets containing unknown intervals are
+excluded rather than assigned invented coverage. Markers
 are omitted if less than 80% of the available span is usable or if their
 validity time expires (at most 15 minutes,
 and never beyond the quota reset). Missing/corrupt history does not interrupt

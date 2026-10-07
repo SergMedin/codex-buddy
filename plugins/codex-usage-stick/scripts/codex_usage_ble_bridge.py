@@ -231,92 +231,304 @@ class UsageSnapshot:
         return packet
 
 
-class QuotaForecast:
-    """Bounded quota observations [time, used %, deadline, cycle].
+@dataclass(frozen=True)
+class QuotaObservation:
+    at: float
+    used: float
+    deadline: float
+    window: int
 
-    A deadline is API metadata, not a cycle identifier: an unused window can
-    slide until first use. Only same-cycle intervals measure consumption.
+    def values(self) -> list[float | int]:
+        return [self.at, self.used, self.deadline, self.window]
+
+
+@dataclass
+class QuotaCounterWindow:
+    # Zero-only windows have no settled identity; their deadline may slide.
+    deadline: float | None
+    high_water: float
+
+
+@dataclass
+class QuotaRateBucket:
+    start: int
+    consumed: float
+    covered: float
+    first_at: float
+    last_at: float
+
+    def values(self) -> list[float | int]:
+        return [self.start, self.consumed, self.covered, self.first_at, self.last_at]
+
+
+@dataclass(frozen=True)
+class QuotaRateInterval:
+    start: float
+    end: float
+    consumed: float
+
+    def values(self) -> list[float]:
+        return [self.start, self.end, self.consumed]
+
+
+class QuotaRateHistory:
+    """Known consumption and time, bounded by the time horizon, not resets.
+
+    Short intervals aggregate into five-minute buckets. A partially queried
+    bucket with unknown holes is omitted; a continuous bucket can be clipped
+    at five-minute rate resolution. Long intervals remain indivisible.
     """
 
-    HISTORY_VERSION = 2
+    def __init__(self, bucket_seconds: int, horizon: int, max_gap: int):
+        self.bucket_seconds = bucket_seconds
+        self.horizon = horizon
+        self.max_gap = max_gap
+        self.started_at: float | None = None
+        self.buckets: dict[int, QuotaRateBucket] = {}
+        self.gaps: list[QuotaRateInterval] = []
+
+    def add(self, before: QuotaObservation, after: QuotaObservation) -> None:
+        duration = after.at - before.at
+        consumed = after.used - before.used
+        if duration <= 0 or consumed < 0:
+            return
+        if duration > self.max_gap:
+            self.gaps.append(QuotaRateInterval(before.at, after.at, consumed))
+            return
+        at = before.at
+        while at < after.at:
+            start = int(math.floor(at / self.bucket_seconds)) * self.bucket_seconds
+            end = min(after.at, start + self.bucket_seconds)
+            covered = end - at
+            amount = consumed * covered / duration
+            bucket = self.buckets.get(start)
+            if bucket is None:
+                self.buckets[start] = QuotaRateBucket(start, amount, covered, at, end)
+            else:
+                bucket.consumed += amount
+                bucket.covered += covered
+                bucket.last_at = end
+            at = end
+
+    def prune(self, at: float) -> None:
+        cutoff = at - self.horizon
+        self.buckets = {start: bucket for start, bucket in self.buckets.items()
+                        if start + self.bucket_seconds > cutoff}
+        self.gaps = [gap for gap in self.gaps if gap.end > cutoff]
+
+    def measure(self, start: float, end: float) -> tuple[float, float]:
+        consumed = covered = 0.0
+        for bucket in self.buckets.values():
+            lo, hi = max(start, bucket.first_at), min(end, bucket.last_at)
+            if hi <= lo:
+                continue
+            if lo == bucket.first_at and hi == bucket.last_at:
+                consumed += bucket.consumed
+                covered += bucket.covered
+            elif math.isclose(bucket.covered, bucket.last_at - bucket.first_at,
+                              rel_tol=0, abs_tol=1e-6):
+                # A mixed bucket has unknown holes whose positions were
+                # deliberately compacted; never invent coverage inside them.
+                fraction = (hi - lo) / bucket.covered
+                consumed += bucket.consumed * fraction
+                covered += hi - lo
+        for gap in self.gaps:
+            if start <= gap.start and gap.end <= end:
+                consumed += gap.consumed
+                covered += gap.end - gap.start
+        return consumed, covered
+
+
+class QuotaForecast:
+    """Reconcile counter windows before training a bounded rate history.
+
+    A known window can reappear after another window was observed. Its prior
+    counter is a baseline, not new consumption; switches always break the
+    measured interval. This also makes an erroneous reset reversible.
+    """
+
+    HISTORY_VERSION = 3
     HORIZONS = {"secondary_forecast_48h": 2 * 86400, "secondary_forecast_14d": 14 * 86400}
     SAMPLE_SECONDS = 300
     MIN_HISTORY_SECONDS = 3600
     TTL_SECONDS = QUOTA_TTL_SECONDS
     MAX_INTERPOLATION_GAP = 6 * 3600
-    MAX_POINTS = 4100
-    RESET_TOLERANCE_SECONDS = 5  # API/log reset timestamps can differ by rounding.
+    RESET_TOLERANCE_SECONDS = 5
+    # Distinct settled identities are more than five seconds apart within a
+    # seven-day future range. One unresolved zero window needs one more slot.
+    MAX_WINDOWS = 7 * 86400 // RESET_TOLERANCE_SECONDS + 3
+    MAX_HISTORY_BYTES = 32 * 1024 * 1024
+    MAX_LEGACY_POINTS = 1_000_000
 
     def __init__(self, path: Path):
         self.path = path
         self.key: list[Any] | None = None
-        self.points: list[list[float | int]] = []
         self.status = "unavailable"
-        self._latest: list[float | int] | None = None
-        self._needs_migration = False
+        self.latest: QuotaObservation | None = None
+        self.windows: dict[int, QuotaCounterWindow] = {}
+        self.history = self._new_history()
+        self._saved_at: float | None = None
         self._dirty = False
+        self._needs_migration = False
         self._load()
+
+    def _new_history(self) -> QuotaRateHistory:
+        return QuotaRateHistory(self.SAMPLE_SECONDS, max(self.HORIZONS.values()),
+                                self.MAX_INTERPOLATION_GAP)
+
+    @staticmethod
+    def _finite(value: Any) -> bool:
+        return type(value) in (int, float) and math.isfinite(value)
+
+    def _valid_observation(self, values: Any, *, with_window: bool) -> bool:
+        if not isinstance(values, list) or len(values) != (4 if with_window else 3):
+            return False
+        if not all(self._finite(value) for value in values):
+            return False
+        t, p, r = values[:3]
+        return (0 < t < r <= t + 7 * 86400 + self.RESET_TOLERANCE_SECONDS
+                and 0 <= p <= 100 and (not with_window or
+                (type(values[3]) is int and 0 <= values[3] < 2 ** 63)))
 
     def _load(self) -> None:
         try:
-            if self.path.stat().st_size > 1024 * 1024:
+            if self.path.stat().st_size > self.MAX_HISTORY_BYTES:
                 return
             data = json.loads(self.path.read_text())
-            if not isinstance(data, dict) or data.get("version") not in (1, self.HISTORY_VERSION):
+            if not isinstance(data, dict) or type(data.get("version")) is not int:
                 return
-            version = data["version"]
-            points = data.get("points")
-            if not isinstance(points, list) or len(points) > self.MAX_POINTS:
-                return
-            previous_point = None
-            for point in points:
-                if not self._valid_point(point, version, previous_point):
-                    return
-                previous_point = point
-            latest = data.get("latest", previous_point)
-            if version == self.HISTORY_VERSION and points:
-                if not self._valid_point(latest, version):
-                    return
-                if latest != previous_point and not self._valid_point(latest, version, previous_point):
-                    return
-            elif version == self.HISTORY_VERSION and latest is not None:
-                return
-            self.key = data.get("key")
-            if version == 1:
-                # Reclassify old deadline-based cycles and restore the sampling
-                # cadence. Migration does not write until a live observation.
-                for point in points:
-                    self._record(point[0], point[1], point[2])
-                if self._latest and self.points[-1] != self._latest:
-                    self._append(self._latest)
-                self._needs_migration = True
-            else:
-                self.points = points
-                self._latest = latest
+            if data["version"] in (1, 2):
+                self._load_legacy(data)
+            elif data["version"] == self.HISTORY_VERSION:
+                self._load_current(data)
         except (OSError, ValueError, TypeError, OverflowError):
+            # Validation is all-or-nothing; these methods assign only when
+            # the complete document has passed its schema invariants.
             pass
 
-    def _valid_point(self, point: Any, version: int,
-                     previous: list[float | int] | None = None) -> bool:
-        if not isinstance(point, list) or len(point) != (3 if version == 1 else 4):
-            return False
-        if not all(type(v) in (int, float) and math.isfinite(v) for v in point):
-            return False
-        t, p, r = point[:3]
-        if not 0 < t < r <= t + 7 * 86400 + self.RESET_TOLERANCE_SECONDS or not 0 <= p <= 100:
-            return False
-        if version == self.HISTORY_VERSION and (type(point[3]) is not int or point[3] < 0):
-            return False
-        if previous is None:
-            return True
-        same_cycle = r == previous[2] if version == 1 else point[3] == previous[3]
-        return (t > previous[0] and (not same_cycle or p >= previous[1])
-                and (version == 1 or point[3] >= previous[3]))
+    def _load_legacy(self, data: dict[str, Any]) -> None:
+        points = data.get("points")
+        if not isinstance(points, list) or len(points) > self.MAX_LEGACY_POINTS:
+            return
+        previous = None
+        for point in points:
+            if not self._valid_observation(point, with_window=data["version"] == 2):
+                return
+            if previous is not None and point[0] <= previous[0]:
+                return
+            if previous is not None:
+                same_hint = (point[2] == previous[2] if data["version"] == 1 else point[3] == previous[3])
+                if (same_hint and point[1] < previous[1]) or (data["version"] == 2 and point[3] < previous[3]):
+                    return
+            previous = point
+        latest = data.get("latest", previous) if data["version"] == 2 else previous
+        if data["version"] == 2 and points:
+            if not self._valid_observation(latest, with_window=True):
+                return
+            if latest != previous and (latest[0] <= previous[0] or latest[3] < previous[3]
+                    or (latest[3] == previous[3] and latest[1] < previous[1])):
+                return
+        elif data["version"] == 2 and latest is not None:
+            return
+        # Replay into a separate object: v2 cycle IDs encoded a past inference,
+        # not API identity, so reconciling raw t/p/r repairs replay pollution.
+        staged = object.__new__(QuotaForecast)
+        staged.latest, staged.windows, staged.history = None, {}, self._new_history()
+        staged._dirty = False
+        for point in points:
+            staged._record(*point[:3])
+        if latest is not None and latest != previous:
+            staged._record(*latest[:3])
+        self.key = data.get("key")
+        self.latest, self.windows, self.history = staged.latest, staged.windows, staged.history
+        self._saved_at = self.latest.at if self.latest else None
+        self._needs_migration = True
+
+    def _load_current(self, data: dict[str, Any]) -> None:
+        raw = data.get("history")
+        latest_values, window_values = data.get("latest"), data.get("windows")
+        if not isinstance(raw, dict) or not isinstance(window_values, list):
+            return
+        if len(window_values) > self.MAX_WINDOWS:
+            return
+        windows = {}
+        for value in window_values:
+            if not isinstance(value, list) or len(value) != 3:
+                return
+            identity, deadline, used = value
+            if (type(identity) is not int or not 0 <= identity < 2 ** 63 or identity in windows
+                    or (deadline is not None and not self._finite(deadline))
+                    or not self._finite(used) or not 0 <= used <= 100
+                    or (deadline is None and used != 0) or (deadline is not None and used == 0)):
+                return
+            windows[identity] = QuotaCounterWindow(deadline, used)
+        deadlines = sorted(window.deadline for window in windows.values() if window.deadline is not None)
+        if any(b - a <= self.RESET_TOLERANCE_SECONDS for a, b in zip(deadlines, deadlines[1:])):
+            return
+        if latest_values is None:
+            if windows or raw.get("started_at") is not None or raw.get("buckets") != [] or raw.get("gaps") != []:
+                return
+            latest = None
+        else:
+            if not self._valid_observation(latest_values, with_window=True):
+                return
+            latest = QuotaObservation(*latest_values)
+            if latest.window not in windows or windows[latest.window].high_water != latest.used:
+                return
+            for window in windows.values():
+                if window.deadline is not None and not (latest.at - self.RESET_TOLERANCE_SECONDS
+                        < window.deadline <= latest.at + 7 * 86400 + self.RESET_TOLERANCE_SECONDS):
+                    return
+            if sum(window.deadline is None for window in windows.values()) > 1:
+                return
+            active_deadline = windows[latest.window].deadline
+            if active_deadline is not None and abs(latest.deadline - active_deadline) > self.RESET_TOLERANCE_SECONDS:
+                return
+        history = self._new_history()
+        started = raw.get("started_at")
+        if latest is not None and (not self._finite(started) or not 0 < started <= latest.at):
+            return
+        history.started_at = started
+        buckets, gaps = raw.get("buckets"), raw.get("gaps")
+        if not isinstance(buckets, list) or len(buckets) > math.ceil(history.horizon / history.bucket_seconds) + 1:
+            return
+        if not isinstance(gaps, list) or len(gaps) > math.ceil(history.horizon / history.max_gap) + 1:
+            return
+        cutoff = latest.at - history.horizon if latest else 0
+        for value in buckets:
+            if not isinstance(value, list) or len(value) != 5 or not all(self._finite(v) for v in value):
+                return
+            start, consumed, covered, first, last = value
+            if (type(start) is not int or start % history.bucket_seconds or start in history.buckets
+                    or not start <= first < last <= start + history.bucket_seconds
+                    or not 0 < covered <= last - first + 1e-6 or consumed < 0
+                    or latest is None or not started <= first < last <= latest.at
+                    or start + history.bucket_seconds <= cutoff):
+                return
+            history.buckets[start] = QuotaRateBucket(*value)
+        previous_end = 0
+        for value in gaps:
+            if not isinstance(value, list) or len(value) != 3 or not all(self._finite(v) for v in value):
+                return
+            start, end, consumed = value
+            if (latest is None or not started <= start < end <= latest.at
+                    or end - start <= history.max_gap or start < previous_end or consumed < 0
+                    or end <= cutoff or consumed > 100):
+                return
+            previous_end = end
+            history.gaps.append(QuotaRateInterval(*value))
+        # A long gap may touch endpoint buckets, but cannot overlap their
+        # actual observed extents; otherwise serialized time is double counted.
+        for gap in history.gaps:
+            if any(bucket.first_at < gap.end and bucket.last_at > gap.start
+                   for bucket in history.buckets.values()):
+                return
+        self.key, self.latest, self.windows, self.history = data.get("key"), latest, windows, history
+        self._saved_at = latest.at if latest else None
 
     def seed(self, current: UsageSnapshot, logs: list[UsageSnapshot],
              key: list[Any], earliest: float = 0) -> None:
-        """One-time bootstrap from already-read logs of this live-confirmed cycle."""
-        if self.points and self.key == key:
+        if self.latest is not None and self.key == key:
             return
         t, r = current.quota_observed_at, current.secondary_resets_at
         if t is None:
@@ -326,15 +538,12 @@ class QuotaForecast:
                       and abs(s.secondary_resets_at - r) <= self.RESET_TOLERANCE_SECONDS]
         if not candidates or any(s.secondary > current.secondary for s in candidates):
             return
-        points = []
-        for s in sorted(candidates, key=lambda s: (s.event_ts, -s.secondary)):
-            if points and (s.event_ts - points[-1][0] < self.SAMPLE_SECONDS or s.secondary < points[-1][1]):
-                continue
-            points.append([s.event_ts, s.secondary, r])
-        self.key, self.points, self._latest = key, [], None
-        for t, p, r in points:
-            self._record(t, p, r)
-        self.save()
+        self.key, self.latest, self.windows, self.history = key, None, {}, self._new_history()
+        for sample in sorted(candidates, key=lambda s: (s.event_ts, -s.secondary)):
+            if self._valid_observation([sample.event_ts, sample.secondary, r], with_window=False):
+                self._record(sample.event_ts, sample.secondary, r)
+        if self.latest is not None:
+            self.save()
 
     def save(self) -> None:
         ensure_private_dir(self.path.parent)
@@ -343,140 +552,156 @@ class QuotaForecast:
             with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as f:
                 temp_path = Path(f.name)
                 json.dump({"version": self.HISTORY_VERSION, "key": self.key,
-                           "points": self.points, "latest": self._latest}, f,
+                           "latest": self.latest.values() if self.latest else None,
+                           "windows": [[identity, window.deadline, window.high_water]
+                                       for identity, window in sorted(self.windows.items())],
+                           "history": {"started_at": self.history.started_at,
+                                       "buckets": [bucket.values() for _, bucket in sorted(self.history.buckets.items())],
+                                       "gaps": [gap.values() for gap in self.history.gaps]}}, f,
                           separators=(",", ":"), allow_nan=False)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_path, self.path)
-            self._needs_migration = False
-            self._dirty = False
+            self._saved_at = self.latest.at if self.latest else None
+            self._dirty = self._needs_migration = False
         finally:
             if temp_path is not None:
                 with contextlib.suppress(OSError):
                     temp_path.unlink(missing_ok=True)
 
-    def _classify(self, t: float, p: float, r: int) -> tuple[bool, bool]:
-        """Return (cycle boundary, confirmed reset), independently of sampling."""
-        if self._latest is None:
-            return False, False
-        _, last_p, last_r, _ = self._latest
-        elapsed = t >= last_r
-        moved = abs(r - last_r) > self.RESET_TOLERANCE_SECONDS
-        # A changed deadline after positive usage could hide a reset even if
-        # the new percentage has caught up. Exclude that uncertain interval.
-        # An unused window may slide or anchor on its first use without reset.
-        return elapsed or (moved and last_p > 0), elapsed or (moved and p < last_p)
-
-    def _observation(self, t: float, p: float, r: int) -> tuple[list[float | int] | None, bool]:
-        boundary, confirmed = self._classify(t, p, r)
-        if self._latest:
-            last_t, last_p, last_r, cycle = self._latest
-            if t < last_t or (t == last_t and (p != last_p or r != last_r)):
+    def _reconcile(self, t: float, p: float, r: float) -> tuple[QuotaObservation | None, bool]:
+        latest = self.latest
+        if latest is not None:
+            if t < latest.at or (t == latest.at and (p != latest.used or r != latest.deadline)):
                 return None, False
-            if not boundary and p < last_p:
-                # A decrease without reset evidence is ambiguous. Reject it
-                # rather than counting the recovery from a transient dip twice.
+            if t == latest.at:
+                return latest, True
+        # Prefer a known settled identity. A window may return after an
+        # intervening reset or bad response; its high-water mark survives.
+        matches = [(abs(r - window.deadline), identity) for identity, window in self.windows.items()
+                   if window.deadline is not None and window.deadline > t - self.RESET_TOLERANCE_SECONDS
+                   and abs(r - window.deadline) <= self.RESET_TOLERANCE_SECONDS]
+        if len(matches) > 1:
+            # Overlapping rounding ranges cannot identify the counter. A
+            # nearest-deadline guess could count an old counter as a new gain.
+            return None, False
+        identity = matches[0][1] if matches else None
+        if identity is not None:
+            if p < self.windows[identity].high_water:
                 return None, False
-        else:
-            cycle = 0
-        return [t, p, r, cycle + int(boundary)], confirmed
+            continuous = latest is not None and identity == latest.window and t < latest.deadline
+            return QuotaObservation(t, p, r, identity), continuous
+        if (latest is not None and t < latest.deadline
+                and self.windows[latest.window].deadline is None):
+            moved = abs(r - latest.deadline) > self.RESET_TOLERANCE_SECONDS
+            if not moved:
+                if p < latest.used:
+                    return None, False
+                return QuotaObservation(t, p, r, latest.window), True
+            if latest.used == 0 and p == 0:
+                return QuotaObservation(t, p, r, latest.window), True
+            if latest.used == 0 and p > 0 and r > latest.deadline:
+                # A forward anchoring of an unresolved zero window is usable.
+                # Backward anchoring may predate rounded zero measurements;
+                # accept its new baseline but do not invent its first jump.
+                return QuotaObservation(t, p, r, latest.window), True
+        # Reuse an unresolved zero-only context when it returns between known
+        # settled windows. There is no counter value to count a second time.
+        if p == 0:
+            identity = next((identity for identity, window in self.windows.items()
+                             if window.deadline is None), None)
+        if identity is None:
+            identity = max(self.windows, default=-1) + 1
+            if identity >= 2 ** 63:
+                return None, False
+        return QuotaObservation(t, p, r, identity), False
 
-    def _append(self, point: list[float | int]) -> None:
-        self.points.append(point)
-        self._dirty = True
-        cutoff = point[0] - max(self.HORIZONS.values())
-        while len(self.points) > 1 and self.points[1][0] <= cutoff:
-            self.points.pop(0)
-        self.points = self.points[-self.MAX_POINTS:]
-
-    def _record(self, t: float, p: float, r: int) -> list[float | int] | None:
-        point, confirmed = self._observation(t, p, r)
+    def _record(self, t: float, p: float, r: float) -> QuotaObservation | None:
+        point, continuous = self._reconcile(t, p, r)
         if point is None:
             return None
-        if confirmed and self._latest and self.points[-1] != self._latest:
-            # Preserve the last known interval before the actual reset; only
-            # the interval crossing its boundary is unknown.
-            self._append(self._latest)
-        if (not self.points or confirmed
-                or t - self.points[-1][0] >= self.SAMPLE_SECONDS):
-            self._append(point)
-        elif self._latest and self.points[-1][3] == self._latest[3] and point[3] != self._latest[3]:
-            # Persist the first uncertain boundary without adding a sample.
-            # Further boundaries before the next sample remain one unknown
-            # interval; a restart must never reconnect it to the old cycle.
+        latest = self.latest
+        if latest == point:
+            return point
+        if self.history.started_at is None:
+            self.history.started_at = t
+        if latest is not None and continuous:
+            self.history.add(latest, point)
+        switched = latest is None or latest.window != point.window
+        self.windows = {identity: window for identity, window in self.windows.items()
+                        if identity == point.window or window.deadline is None
+                        or window.deadline > t - self.RESET_TOLERANCE_SECONDS}
+        window = self.windows.get(point.window)
+        if window is None:
+            window = QuotaCounterWindow(r if p > 0 else None, p)
+            self.windows[point.window] = window
+        else:
+            window.high_water = p
+            if p > 0 and window.deadline is None:
+                window.deadline = r
+        self.latest = point
+        self.history.prune(t)
+        # Window changes and new maxima must survive a restart immediately.
+        # Plain idle polls aggregate in memory and save at five-minute cadence.
+        if switched or (latest is not None and p != latest.used):
             self._dirty = True
-        self._latest = point
         return point
 
-    def _project(self, point: list[float | int], *, record: bool) -> dict[str, int]:
-        t, p, r, _ = point
-        points = self.points if self.points and self.points[-1] == point else self.points + [point]
-        # Warmup is a specific condition: an accepted live observation and
-        # less than one hour of history. Missing coverage or rejected samples
-        # are not progress toward a forecast and must not claim otherwise.
-        if record and t - points[0][0] < self.MIN_HISTORY_SECONDS:
+    def _project(self, point: QuotaObservation, *, record: bool) -> dict[str, int]:
+        t, p, r = point.at, point.used, point.deadline
+        started = self.history.started_at if self.history.started_at is not None else t
+        if record and t - started < self.MIN_HISTORY_SECONDS:
             self.status = "learning"
         fields = {}
         for name, horizon in self.HORIZONS.items():
-            start = max(points[0][0], t - horizon)
+            start = max(started, t - horizon)
             span = t - start
             if span < self.MIN_HISTORY_SECONDS:
                 continue
-            consumed = covered = 0.0
-            for a, b in zip(points, points[1:]):
-                duration = b[0] - a[0]
-                overlap = b[0] - max(start, a[0])
-                if overlap <= 0 or duration <= 0 or a[3] != b[3] or b[1] < a[1]:
-                    continue
-                # A whole same-cycle gap has a known total delta, including sleep.
-                # Do not distribute a long unobserved gap across a window boundary.
-                if overlap < duration and duration > self.MAX_INTERPOLATION_GAP:
-                    continue
-                covered += overlap
-                consumed += (b[1] - a[1]) * overlap / duration
+            consumed, covered = self.history.measure(start, t)
+            # A cached observation newer than the persisted baseline may be
+            # projected, but must not train or modify the durable ledger.
+            if self.latest is not None and point.at > self.latest.at:
+                _, continuous = self._reconcile(point.at, point.used, point.deadline)
+                if continuous:
+                    duration = point.at - self.latest.at
+                    overlap = point.at - max(start, self.latest.at)
+                    if overlap > 0 and (duration <= self.MAX_INTERPOLATION_GAP or overlap == duration):
+                        consumed += (point.used - self.latest.used) * overlap / duration
+                        covered += overlap
             if covered < self.MIN_HISTORY_SECONDS or covered < span * 0.8:
                 continue
-            # Replaying the same observation must not make the projection look
-            # better as time passes, or extend its lifetime.
             forecast = p + consumed / covered * (r - t)
-            # 101 is an overflow indicator, not a literal prediction of 101%.
             fields[name] = 101 if forecast > 100 else max(p, round(forecast))
-            # Preserve precision around zero for the remaining-quota scale.
-            # Saturate only outside its range, before rounding, so even a tiny
-            # overshoot remains distinct from exactly +/-50 pp. Old fields above
-            # remain available to devices running the previous firmware.
             remaining = 100 - forecast
-            remaining_bp = (5100 if remaining > 50 else -5100 if remaining < -50
-                            else round(remaining * 100))
-            fields[name.replace("forecast", "remaining") + "_bp"] = remaining_bp
+            fields[name.replace("forecast", "remaining") + "_bp"] = (
+                5100 if remaining > 50 else -5100 if remaining < -50 else round(remaining * 100))
         if fields:
-            fields["secondary_forecast_valid_until"] = min(r, int(t + self.TTL_SECONDS))
+            fields["secondary_forecast_valid_until"] = min(int(r), int(t + self.TTL_SECONDS))
             self.status = "ready"
         return fields
 
     def packet_fields(self, snapshot: UsageSnapshot, now: float, key: list[Any],
                       *, record: bool = True) -> dict[str, int]:
         self.status = "unavailable"
-        t = snapshot.quota_observed_at
-        p, r = snapshot.secondary, snapshot.secondary_resets_at
-        if t is None or not all(math.isfinite(v) for v in (t, p, r, now)):
-            return {}
-        if (not 0 <= now - t < self.TTL_SECONDS or not 0 <= p <= 100
-                or not now < r <= t + 7 * 86400 + self.RESET_TOLERANCE_SECONDS):
+        t, p, r = snapshot.quota_observed_at, snapshot.secondary, snapshot.secondary_resets_at
+        if (not self._valid_observation([t, p, r], with_window=False) or not self._finite(now)
+                or not 0 <= now - t < self.TTL_SECONDS or not now < r):
             return {}
         if key != self.key:
             if not record:
                 return {}
-            self.key, self.points, self._latest = key, [], None
+            self.key, self.latest, self.windows, self.history = key, None, {}, self._new_history()
+            self._saved_at = None
         if record:
             point = self._record(t, p, r)
             if point is None:
                 return {}
-            if self._needs_migration or self._dirty:
+            if (self._dirty or self._needs_migration or self._saved_at is None
+                    or t - self._saved_at >= self.SAMPLE_SECONDS):
                 self.save()
-                self._dirty = self._needs_migration = False
         else:
-            point, _ = self._observation(t, p, r)
+            point, _ = self._reconcile(t, p, r)
             if point is None:
                 return {}
         return self._project(point, record=record)

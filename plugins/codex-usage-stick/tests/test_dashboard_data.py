@@ -256,7 +256,7 @@ class DashboardDataTest(unittest.TestCase):
         with patch.object(bridge.time, "time", return_value=T):
             fields = bridge.forecast_packet_fields(self.args, replace(self.snapshot(), quota_live=False))
         self.assertEqual(fields, {"secondary_forecast_status": "unavailable"})
-        self.assertEqual(self.args._quota_forecast.points, [])
+        self.assertIsNone(self.args._quota_forecast.latest)
 
     def test_only_real_warmup_reports_learning(self):
         for at, expected in ((T, "learning"), (T + 1800, "learning"), (T + 3600, "ready")):
